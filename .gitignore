@@ -5,3 +5,8 @@ __pycache__/
 .ipynb_checkpoints/
 results/cache/
 datasets/
+
+# bot runtime/build artifacts
+bot/**/__pycache__/
+bot/data/
+*.db

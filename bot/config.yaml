@@ -1,0 +1,98 @@
+# Polymarket BTC Up/Down bot configuration.
+# Secrets (private keys, API creds) are NEVER placed here — see .env / environment variables.
+# This file is safe to commit.
+
+mode:
+  # PAPER is the safety default. Real orders require BOTH paper: false here AND
+  # POLYBOT_LIVE=1 in the environment AND a private key present. See execution.py.
+  paper: true
+
+# HTTP endpoints (validated against the live APIs; see docs in README).
+endpoints:
+  gamma_base: "https://gamma-api.polymarket.com"
+  clob_base: "https://clob.polymarket.com"
+  clob_ws: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  binance_rest_base: "https://data-api.binance.vision"   # portable everywhere (api.binance.com is geo-blocked in some sandboxes)
+  binance_ws_base: "wss://stream.binance.com:9443"        # optional, off by default
+
+# TLS: cafile resolved at runtime from POLYBOT_CA_BUNDLE env var if set, else
+# /root/.ccr/ca-bundle.crt if that file exists (dev sandbox), else system default (real server).
+
+fees:
+  fee_rate: 0.07   # taker fee = fee_rate * p * (1-p) per share; maker = 0
+
+families:
+  1h:
+    enabled: true
+    duration_secs: 3600
+    oracle: binance          # 1h resolves on Binance BTC/USDT 1H candle
+    close_snipe: true        # PRIMARY strategy — default ON for 1h only
+    settle_sweep: true
+  15m:
+    enabled: true
+    duration_secs: 900
+    oracle: chainlink        # requires a configured Chainlink oracle; else close_snipe stays OFF
+    close_snipe: false       # OFF until a Chainlink oracle is wired (see oracle.py ChainlinkOracle stub)
+    settle_sweep: true
+  5m:
+    enabled: true
+    duration_secs: 300
+    oracle: chainlink
+    close_snipe: false
+    settle_sweep: true
+  4h:
+    enabled: true
+    duration_secs: 14400
+    oracle: chainlink
+    close_snipe: false
+    settle_sweep: true
+
+strategy:
+  close_snipe:
+    snipe_last_secs: 6       # fire in the last N seconds before close
+    edge_min: 0.05            # fair - ask - fee(ask) must exceed this
+    price_min: 0.30           # only take asks in (price_min, price_max)
+    price_max: 0.99
+    vol_window_secs: 120      # rolling window for 1s log-return std
+  settle_sweep:
+    settle_delay_secs: 2      # wait after close before sweeping (oracle/print publish lag)
+    settle_window_secs: 120   # stop sweeping after this many seconds post-close
+    settle_edge_min: 0.02     # 1 - price - fee(price) must exceed this
+    price_max: 0.99
+    distance_guard_usd: 3.0   # for families without a true Chainlink oracle: skip closes closer than this
+
+sizing:
+  per_event_cap_usd: 25       # paper default; also used as live default until scaled up
+  max_open_notional: 250      # global cap across all concurrently open paper/live positions
+
+execution:
+  latency_ms: 1500            # simulated reaction latency before re-fetching the book to fill against
+  order_book_poll_secs: 1.0   # REST /book poll interval when WSS is not used
+  use_websocket: false        # off by default; REST polling is the default, verified path
+
+resolution:
+  gamma_poll_secs: 15         # how often to poll gamma for closed/resolved status on open positions
+  resolution_timeout_mins: 30 # if gamma hasn't resolved within this window, fall back to oracle winner
+
+discovery:
+  poll_secs: 30                # how often to re-scan gamma for new/expiring markets
+  hourly_lookahead_hours: 3    # also probe direct slugs for the next N ET hours
+  events_limit: 200
+  markets_limit: 1000
+
+logging:
+  level: INFO
+  file: "bot/data/polybot.log"
+  max_bytes: 10485760
+  backup_count: 5
+
+status:
+  write_interval_secs: 3
+  http_port_env: "POLYBOT_PORT"   # default 8899, see status_server.py
+  http_port_default: 8899
+  recent_events_keep: 200
+
+storage:
+  sqlite_path: "bot/data/polybot.db"
+  fills_csv: "bot/data/fills.csv"
+  pnl_csv: "bot/data/pnl.csv"
