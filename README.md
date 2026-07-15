@@ -1,7 +1,12 @@
-# Polymarket BTC Up/Down — Strategy Research
+# Polymarket BTC Up/Down — Strategy Research + Trading Bot
 
 Systematic search for executable edges on Polymarket's BTC Up/Down markets (5m/15m/1h/4h),
-from raw data to out-of-sample-validated strategies.
+from raw data to out-of-sample-validated strategies — plus a production paper-trading bot
+implementing the surviving strategies with a gated live-order path.
+
+- **The bot (paper-trading now, live-capable): [`bot/README.md`](bot/README.md)**
+- Executability re-audit (which strategy is actually tradeable): [`docs/04_executability_audit.md`](docs/04_executability_audit.md)
+- Live-verified CLOB API spec: [`docs/05_clob_api_spec.md`](docs/05_clob_api_spec.md)
 
 - **Final report (ranked strategies, OOS numbers, risks): [`docs/03_final_report.md`](docs/03_final_report.md)**
 - Data audit: [`docs/01_data_audit.md`](docs/01_data_audit.md)
