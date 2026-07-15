@@ -227,6 +227,14 @@ class Engine:
 
         sig = evaluate_close_snipe(market, now, S_t, S_open, sigma_1s, book_up, book_down,
                                     cfg, self.config.fee_rate)
+        # Always log evaluation ticks inside the snipe window (max snipe_last
+        # lines per window) — "evaluated, no edge" must be distinguishable
+        # from "never ran" when auditing a live close.
+        ask_u = book_up.best_ask.price if (book_up and book_up.best_ask) else None
+        ask_d = book_down.best_ask.price if (book_down and book_down.best_ask) else None
+        log.info("snipe eval %s tau=%.1fs S=%.2f S_open=%.2f sig1s=%.2e askU=%s askD=%s -> %s",
+                 market.slug, tau, S_t, S_open, sigma_1s, ask_u, ask_d,
+                 "SIGNAL" if sig else "no_edge")
         if sig is None:
             return
 
