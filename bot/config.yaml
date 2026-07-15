@@ -28,24 +28,30 @@ families:
     oracle: binance          # 1h resolves on Binance BTC/USDT 1H candle
     close_snipe: true        # PRIMARY strategy — default ON for 1h only
     settle_sweep: true
+  # settle_sweep for the Chainlink families is OFF after live paper evidence
+  # (2026-07-15, first 4.5h of deployment): 358 sweep attempts -> the only 3
+  # fills were ALL Binance-vs-Chainlink disagreement cases and ALL lost
+  # (adverse selection: the only cheap "winner" asks left standing are the
+  # ones the Chainlink-watching market knows are actually losers). Do NOT
+  # re-enable without a real Chainlink oracle wired in oracle.py.
   15m:
     enabled: true
     duration_secs: 900
     oracle: chainlink        # requires a configured Chainlink oracle; else close_snipe stays OFF
     close_snipe: false       # OFF until a Chainlink oracle is wired (see oracle.py ChainlinkOracle stub)
-    settle_sweep: true
+    settle_sweep: false
   5m:
     enabled: true
     duration_secs: 300
     oracle: chainlink
     close_snipe: false
-    settle_sweep: true
+    settle_sweep: false
   4h:
     enabled: true
     duration_secs: 14400
     oracle: chainlink
     close_snipe: false
-    settle_sweep: true
+    settle_sweep: false
 
 strategy:
   close_snipe:

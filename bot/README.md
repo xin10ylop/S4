@@ -211,6 +211,19 @@ bot/
   data/                        # runtime output (git-ignored): db, csv, log, status.json
 ```
 
+## Paper-trading finding #1 (2026-07-15, first 4.5h deployed)
+
+358 settle-sweep attempts across all families: 355 `empty_book`, **3 fills — all
+three on 5m markets, all three `resolution_disagreements`, all three lost**
+(paper −$80). The Binance-proxy winner call was wrong exactly and only on the
+fills the book allowed: the cheap "winner" asks still standing post-close were
+left by traders watching the true oracle (Chainlink) who knew the Binance call
+was wrong. Textbook adverse selection — the distance guard cannot fix a
+selection effect. Consequence: `settle_sweep` is now **disabled for 5m/15m/4h
+in config.yaml** until a real Chainlink oracle is wired; it remains ON for 1h
+(Binance IS that family's resolution source — zero basis risk; its 4.5h of
+attempts show only clean `empty_book` outcomes, no poisoned fills).
+
 ## Known TODOs
 
 - **Chainlink oracle not wired** (`oracle.py::ChainlinkOracle`) — 5m/15m/4h
