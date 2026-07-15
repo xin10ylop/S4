@@ -38,3 +38,53 @@ ts,hypothesis,family,dataset,n,metric,value,edge_cents_per_share_after_fees,verd
 2026-07-15T02:15:34,1h settle+2s buy-winner<98.5c,1h,train,138,EV_c_per_share,33.68,33.68,PROMISING,"winrate=1.0,med_size=144.0,t=20.6"
 2026-07-15T02:15:34,1h settle+5s buy-winner<98.5c,1h,train,138,EV_c_per_share,33.68,33.68,PROMISING,"winrate=1.0,med_size=144.0,t=20.6"
 2026-07-15T02:15:34,1h settle+10s buy-winner<98.5c,1h,train,139,EV_c_per_share,33.75,33.75,PROMISING,"winrate=1.0,med_size=143.0,t=20.8"
+2026-07-15T02:18:14,H13 pre-open maker fade X/Y grid,5m,train,10566,best_EV_c,1.54,1.54,PROMISING,"best X=0.47,Y=0.58,exit=abort10,wr=0.559; maker fees=0"
+2026-07-15T02:18:14,H13 pre-open maker fade X/Y grid,15m,train,8335,best_EV_c,0.46,0.46,PROMISING,"best X=0.47,Y=0.58,exit=abort10,wr=0.48; maker fees=0"
+2026-07-15T02:18:15,H13 pre-open maker fade X/Y grid,1h,train,2327,best_EV_c,0.25,0.25,FAIL,"best X=0.47,Y=0.53,exit=abort10,wr=0.442; maker fees=0"
+2026-07-15T02:18:42,H13 pre-open maker fade (fee-correct aborts),5m,train,4806,best_EV_c,1.31,1.31,PROMISING,"X=0.45,Y=0.58,abort=op10,wr=0.516"
+2026-07-15T02:18:42,H13 pre-open maker fade (fee-correct aborts),15m,train,3613,best_EV_c,-0.04,-0.04,MARGINAL,"X=0.45,Y=0.55,abort=op10,wr=0.418"
+2026-07-15T02:19:14,H7 side-prediction ML (pre-open feats),5m,train-cv,18070,AUC_GBM,0.52077,,WEAK,"LR=0.5193, acc=0.5113"
+2026-07-15T02:19:16,H7 side-prediction ML (pre-open feats),15m,train-cv,14761,AUC_GBM,0.52256,,WEAK,"LR=0.5258, acc=0.5167"
+2026-07-15T02:19:18,H7 side-prediction ML (pre-open feats),1h,train-cv,4575,AUC_GBM,0.51701,,WEAK,"LR=0.5282, acc=0.5189"
+2026-07-15T02:19:19,H7 side-prediction ML (pre-open feats),4h,train-cv,835,AUC_GBM,0.51907,,WEAK,"LR=0.5496, acc=0.5281"
+2026-07-15T02:23:55,H26 spike-follow (underreaction) taker,5m,train,19000,EV_c_bucket_range,1.0,1.0,FAIL,outcome bias +2.6c real but spread+fee eats it; only 4-6sigma early pocket n=25
+2026-07-15T02:23:55,H26 spike-follow (underreaction) taker,15m,train,62000,EV_c_bucket_range,0.5,0.5,FAIL,same; pockets inconsistent
+2026-07-15T02:23:55,H27 thin-book push fade,5m,train,93844,rev30_c,0.93,0.5,WEAK,true reversion 0.9c thin books; below maker-capture threshold after abort risk
+2026-07-15T02:23:55,H4 streak->price gambler fallacy,15m,train,14761,bias_c,1.0,0.5,WEAK,crowd prices reversal after streaks; actual anti-persistence partly real; residual <=1c
+2026-07-15T02:23:55,H1-H8 ML side prediction pre-open,all,train-cv,38241,AUC,0.52,0.0,FAIL,BTC direction unpredictable pre-open; AUC 0.52
+2026-07-15T02:26:33,H16 favorite-buy@0.25life taker 0.65-0.88,1h,train,1182,EV_c,-0.08,-0.08,FAIL,wr=0.752
+2026-07-15T02:26:33,H16 favorite-buy@0.5life taker 0.65-0.88,1h,train,1219,EV_c,-0.55,-0.55,FAIL,wr=0.776
+2026-07-15T02:26:33,H16 favorite-buy@0.75life taker 0.65-0.88,1h,train,736,EV_c,1.78,1.78,FAIL,wr=0.808
+2026-07-15T02:26:39,H16 favorite-buy@0.25life taker 0.65-0.88,4h,train,223,EV_c,-8.7,-8.7,FAIL,wr=0.664
+2026-07-15T02:26:39,H16 favorite-buy@0.5life taker 0.65-0.88,4h,train,216,EV_c,-9.24,-9.24,FAIL,wr=0.681
+2026-07-15T02:26:39,H16 favorite-buy@0.75life taker 0.65-0.88,4h,train,162,EV_c,-3.4,-3.4,FAIL,wr=0.747
+2026-07-15T02:27:55,H16-maker favorite-bid@0.3life,1h,train,1579,EV_c,0.97087,0.971,FAIL,"strict trade-through fills, maker 0 fee"
+2026-07-15T02:28:30,H16-maker favorite-bid@0.6life,1h,train,1202,EV_c,1.61306,1.613,FAIL,"strict trade-through fills, maker 0 fee"
+2026-07-15T02:28:38,H16-maker favorite-bid@0.3life,4h,train,300,EV_c,-4.23333,-4.233,FAIL,"strict trade-through fills, maker 0 fee"
+2026-07-15T02:28:45,H16-maker favorite-bid@0.6life,4h,train,228,EV_c,-1.94737,-1.947,FAIL,"strict trade-through fills, maker 0 fee"
+2026-07-15T02:30:37,H8 time-of-day bias,5m,train,18135,max_bias_c,1.32956,1.33,FAIL,"{""0"":-1.33,""1"":0.5,""2"":-0.07,""3"":0.22,""4"":0.37,""5"":0.72,""6"":1.27,""7"":-0.56}"
+2026-07-15T02:30:37,H8 time-of-day bias,15m,train,16460,max_bias_c,2.53952,2.54,WEAK,"{""0"":0.9,""1"":-2.54,""2"":-0.81,""3"":0.13,""4"":0.19,""5"":-0.1,""6"":0.38,""7"":0.68}"
+2026-07-15T02:30:37,H29 fee-era favorite bias close-10s,15m,train-fee,316,bias_c,2.56741,,INFO,
+2026-07-15T02:30:37,H29 fee-era favorite bias close-10s,15m,train-free,209,bias_c,3.42823,,INFO,
+2026-07-15T02:30:37,H19 both-sides pre-open set buy 0.49,5m,train,16089,EV_c,-0.70645,-0.706,FAIL,joint fill rate 0.195
+2026-07-15T02:30:38,H19 both-sides pre-open set buy 0.49,15m,train,12520,EV_c,-1.89712,-1.897,FAIL,joint fill rate 0.111
+2026-07-15T02:31:46,H24 cross-family dominance arb 5m/15m,5m+15m,train(apr2-15),320241,violation_secs,1508.0,,PROMISING,windows=155
+2026-07-15T02:32:51,"H24 dominance arb exec (t+1 fills, both taker)",5m+15m,train(apr2-15),105,EV_c_pair,11.38202,11.382,PROMISING,wr=0.486 lottery2x=0.105
+2026-07-15T02:35:04,H28 signed-flow beyond price @close-60s,5m,train-cv,6569,AUC_delta,0.08743,,PROMISING,base=0.7064
+2026-07-15T02:35:04,H28 signed-flow beyond price @close-60s,15m,train-cv,2592,AUC_delta,0.09187,,PROMISING,base=0.6910
+2026-07-15T02:35:05,H9-11 fade filter: lowvol(rv1m<med),5m,train,2208,EV_c,1.07207,1.072,INFO,on X=.45/Y=.58 fade
+2026-07-15T02:35:05,H9-11 fade filter: highvol(rv1m>med),5m,train,2598,EV_c,1.50502,1.505,INFO,on X=.45/Y=.58 fade
+2026-07-15T02:35:05,H9-11 fade filter: tight book(spread<=2c),5m,train,2627,EV_c,1.31105,1.311,INFO,on X=.45/Y=.58 fade
+2026-07-15T02:35:05,H9-11 fade filter: preopen n>=20 trades,5m,train,4799,EV_c,1.31396,1.314,INFO,on X=.45/Y=.58 fade
+2026-07-15T02:35:05,H9-11 fade filter: preflow small(|flow|<100),5m,train,83,EV_c,3.33973,3.34,PROMISING,on X=.45/Y=.58 fade
+2026-07-15T02:35:29,H28 flow-follow taker @close-60s,5m,train-oof,4265,EV_c,15.76,15.76,PROMISING,"minedge=0.08,wr=0.575"
+2026-07-15T02:35:29,H28 flow-follow taker @close-60s,15m,train-oof,1754,EV_c,16.03,16.03,PROMISING,"minedge=0.08,wr=0.621"
+2026-07-15T02:35:54,H28 flow-follow (no lookahead) @close-60s,5m,train-oof,5045,EV_c,-2.08124,-2.081,FAIL,
+2026-07-15T02:35:54,H28 flow-follow (no lookahead) @close-60s,15m,train-oof,1829,EV_c,-0.05308,-0.053,FAIL,
+2026-07-15T02:36:19,H28 flow-follow normalized (final),5m,train-oof,13,EV_c,30.85878,30.859,PROMISING,AUC delta=-0.0001
+2026-07-15T02:36:20,H28 flow-follow normalized (final),15m,train-oof,196,EV_c,6.47033,6.47,PROMISING,AUC delta=+0.0040
+2026-07-15T02:37:38,H21 4h symmetric MM ±2c proxy,4h,train,569,net_c_per_quote_pair,-2.95905,,FAIL,both=0.478 onesided=0.485 invEV=-10.04c
+2026-07-15T02:49:13,STRAT close-snipe last6s strict sim,1h,train,254,EV_c,20.01642,20.016,PROMISING,1.26/day wr .88; decays Mar-Apr — OOS will judge
+2026-07-15T02:49:13,STRAT settlement buy-winner strict sim,1h,train,143,EV_c,35.18076,35.181,PROMISING,0.71/day wr 1.0 med_px .52; regime-dependent frequency
+2026-07-15T02:49:13,STRAT close-snipe strict (binance signal),5m,train,3078,EV_c,-0.33389,-0.334,FAIL,basis noise kills it; CL-signal variant pending
+2026-07-15T02:49:13,STRAT settlement strict,5m,train,384,EV_c,15.62342,15.623,PROMISING,6.1/day; wr .85 w/ binance fallback errors pre-Apr; +32c with real CL feed; RACE risk high on 5m
