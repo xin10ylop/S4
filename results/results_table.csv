@@ -88,3 +88,5 @@ ts,hypothesis,family,dataset,n,metric,value,edge_cents_per_share_after_fees,verd
 2026-07-15T02:49:13,STRAT settlement buy-winner strict sim,1h,train,143,EV_c,35.18076,35.181,PROMISING,0.71/day wr 1.0 med_px .52; regime-dependent frequency
 2026-07-15T02:49:13,STRAT close-snipe strict (binance signal),5m,train,3078,EV_c,-0.33389,-0.334,FAIL,basis noise kills it; CL-signal variant pending
 2026-07-15T02:49:13,STRAT settlement strict,5m,train,384,EV_c,15.62342,15.623,PROMISING,6.1/day; wr .85 w/ binance fallback errors pre-Apr; +32c with real CL feed; RACE risk high on 5m
+2026-07-15T03:14:00,OOS: 5m pre-open fade X.45/Y.58/abort10,5m,TEST,1702,EV_c,0.67033,0.67,PASS,wr=0.501
+2026-07-15T03:15:26,OOS: dominance arb 5m/15m,5m+15m,TEST,304,EV_c_pair,17.7998,17.8,PASS,days=29

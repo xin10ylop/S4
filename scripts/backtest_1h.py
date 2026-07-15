@@ -31,6 +31,8 @@ EDGE_MIN_B = 0.02
 SNIPE_FROM = -6  # last seconds only: tau small, model risk minimal
 SETTLE_MAX = 300
 DOLLARS = 10.0
+import os
+LAT = int(os.environ.get("TLX_LAT", "1"))
 
 
 def fee(p):
@@ -100,7 +102,7 @@ def run_day(day, wall):
                 continue
             z = np.log(S_t / S_open) / sig
             fair = norm.cdf(z)
-            row = grid.loc[t + 1] if t + 1 in grid.index else None  # 1s latency fill
+            row = grid.loc[t + LAT] if t + LAT in grid.index else None  # latency fill
             if row is None:
                 continue
             for side in ("up", "down"):

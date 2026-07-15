@@ -29,6 +29,8 @@ EDGE_MIN_B = 0.02
 SNIPE_LAST = 6
 SETTLE_MAX = 120
 DOLLARS = 10.0
+import os
+LAT = int(os.environ.get("TLX_LAT", "1"))
 CAP_B = 500
 USE_CL_SIGNAL = False
 
@@ -116,9 +118,9 @@ def run_day(fam, day, wall):
                 continue
             z = np.log(S_t / S_open) / sig
             fair = norm.cdf(z)
-            if t + 1 not in grid.index:
+            if t + LAT not in grid.index:
                 continue
-            row = grid.loc[t + 1]
+            row = grid.loc[t + LAT]
             for side in ("up", "down"):
                 px = row.ask if side == "up" else (1 - row.bid if pd.notna(row.bid) else np.nan)
                 szq = row.az if side == "up" else row.bs
