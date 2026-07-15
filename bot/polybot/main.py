@@ -107,6 +107,70 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pnl(args: argparse.Namespace) -> int:
+    """Per-strategy / per-family breakdown straight from the SQLite ledger."""
+    import sqlite3
+
+    config = load_config(args.config)
+    db_path = config.sqlite_path
+    if not db_path.exists():
+        print(f"No ledger DB at {db_path} — has the bot run yet?")
+        return 1
+    db = sqlite3.connect(str(db_path))
+
+    print("== SIGNALS per strategy/family ==")
+    rows = list(db.execute(
+        "SELECT strategy, family, COUNT(*) FROM signals GROUP BY 1,2 ORDER BY 1,2"))
+    for st, fam, n in rows:
+        print(f"  {st:<14} {fam:<4} signals={n}")
+    if not rows:
+        print("  (none yet)")
+
+    print("\n== FILL ATTEMPTS per strategy/family/outcome ==")
+    rows = list(db.execute(
+        "SELECT strategy, family, outcome, COUNT(*), ROUND(SUM(shares),2), "
+        "ROUND(SUM(cost_usd),2) FROM fills GROUP BY 1,2,3 ORDER BY 1,2,3"))
+    for st, fam, out, n, sh, cost in rows:
+        print(f"  {st:<14} {fam:<4} {out:<20} n={n:<5} shares={sh or 0:<9} cost=${cost or 0}")
+    if not rows:
+        print("  (none yet)")
+
+    print("\n== REALIZED PnL per strategy/family (resolved positions) ==")
+    tot: dict = {}
+    for fam, pj in db.execute(
+            "SELECT family, pnl_json FROM resolutions WHERE pnl_json IS NOT NULL"):
+        for p in json.loads(pj):
+            k = (p.get("strategy"), fam)
+            agg = tot.setdefault(k, {"n": 0, "pnl": 0.0, "wins": 0, "shares": 0.0})
+            agg["n"] += 1
+            agg["pnl"] += p.get("realized_pnl", 0.0)
+            agg["shares"] += p.get("shares", 0.0)
+            if p.get("realized_pnl", 0.0) > 0:
+                agg["wins"] += 1
+    for (st, fam), a in sorted(tot.items()):
+        evps = (a["pnl"] / a["shares"]) if a["shares"] else float("nan")
+        print(f"  {st:<14} {fam:<4} resolved={a['n']:<4} win_rate={a['wins']/a['n']:.3f} "
+              f"pnl=${a['pnl']:.4f} ev_per_share=${evps:.4f}")
+    if not tot:
+        print("  (no resolved positions yet)")
+
+    print("\n== close_snipe evaluation activity (log) ==")
+    log_path = config.log_file
+    n_eval = n_sig = 0
+    if log_path.exists():
+        with open(log_path) as f:
+            for line in f:
+                if "snipe eval" in line:
+                    n_eval += 1
+                    if "-> SIGNAL" in line:
+                        n_sig += 1
+        print(f"  eval ticks logged: {n_eval}  signals: {n_sig}  "
+              f"(no SIGNAL on a close = evaluated, book fairly priced — normal)")
+    else:
+        print(f"  (log file {log_path} not found)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m polybot.main")
     p.add_argument("--config", default=None, help="path to config.yaml (default: bot/config.yaml)")
@@ -115,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="run the main trading loop").set_defaults(func=cmd_run)
     sub.add_parser("status", help="pretty-print status.json + pnl summary").set_defaults(func=cmd_status)
     sub.add_parser("markets", help="list currently-tracked BTC markets").set_defaults(func=cmd_markets)
+    sub.add_parser("pnl", help="per-strategy/per-family PnL + attempts from the ledger DB").set_defaults(func=cmd_pnl)
     return p
 
 
