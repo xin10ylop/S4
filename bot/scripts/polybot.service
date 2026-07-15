@@ -1,0 +1,24 @@
+[Unit]
+Description=polybot - Polymarket BTC Up/Down paper/live trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/S4/bot
+EnvironmentFile=-/root/S4/bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/S4/bot/venv/bin/python -m polybot.main run
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/root/S4/bot/data/polybot.service.log
+StandardError=append:/root/S4/bot/data/polybot.service.log
+
+# Basic hardening. Remove/relax if it interferes with your deployment.
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/root/S4/bot/data
+
+[Install]
+WantedBy=multi-user.target

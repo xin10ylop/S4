@@ -22,6 +22,7 @@ _HOURLY_RE = re.compile(r"^bitcoin-up-or-down-[a-z]+-\d{1,2}-\d{4}-\d{1,2}(am|pm
 _SHORT_RE = re.compile(r"^btc-updown-(5m|15m|4h)-(\d+)$")
 
 _SHORT_DURATION = {"5m": 300, "15m": 900, "4h": 14400}
+_DURATION_SECS = {"1h": 3600, **_SHORT_DURATION}
 
 
 @dataclass
@@ -70,12 +71,23 @@ def _parse_market(m: dict) -> Optional[Market]:
         return None
     if len(token_ids) != 2:
         return None
-    # For short families the true window start is encoded in the slug (more
-    # reliable than startDate, which can reflect market-creation time).
+    # IMPORTANT: gamma's `startDate` field is NOT the pricing-window open —
+    # for hourly markets it is ~2 days before `endDate` (market listing
+    # time). The true window start for every family is always
+    # `endDate - duration`; for short families that also matches the unix
+    # timestamp embedded in the slug (cross-checked below as a sanity check).
+    duration = _DURATION_SECS[family]
+    derived_start = end_date - dt.timedelta(seconds=duration)
     if family in _SHORT_DURATION:
         sm = _SHORT_RE.match(slug)
         window_start_unix = int(sm.group(2))
-        start_date = dt.datetime.fromtimestamp(window_start_unix, tz=dt.timezone.utc)
+        slug_start = dt.datetime.fromtimestamp(window_start_unix, tz=dt.timezone.utc)
+        if abs((slug_start - derived_start).total_seconds()) > 1:
+            log.warning("slug window_start %s != endDate-duration %s for %s", slug_start,
+                        derived_start, slug)
+        start_date = slug_start
+    else:
+        start_date = derived_start
     return Market(
         slug=slug,
         family=family,
@@ -110,9 +122,21 @@ class GammaClient:
         self.session = get_session()
         self.base = config.gamma_base
 
-    def get_market_by_slug(self, slug: str) -> Optional[dict]:
+    def get_market_by_slug(self, slug: str, closed: Optional[bool] = None) -> Optional[dict]:
+        """Look up a market by slug.
+
+        IMPORTANT (live-verified quirk): when the `closed` query param is
+        omitted, gamma behaves as if `closed=false` were passed — a market
+        that has already resolved returns an EMPTY list unless you pass
+        `closed=true` explicitly. Discovery (open markets) should leave
+        `closed=None` (omitted); resolution polling (ledger.py) must pass
+        `closed=True` once the window's close time has passed.
+        """
+        params = {"slug": slug}
+        if closed is not None:
+            params["closed"] = str(closed).lower()
         try:
-            r = self.session.get(f"{self.base}/markets", params={"slug": slug}, timeout=10)
+            r = self.session.get(f"{self.base}/markets", params=params, timeout=10)
             r.raise_for_status()
             data = r.json()
         except Exception as exc:  # noqa: BLE001
@@ -171,9 +195,18 @@ def discover_markets(gamma: GammaClient, config: Config) -> Dict[str, Market]:
       1. Direct slug construction (authoritative, low-latency): compute the
          current + next few windows for every family and look them up
          individually. This is the primary source — deterministic and fast.
-      2. Broad scan of gamma /markets and /events (closed=false), pattern
-         filtered. Catches anything the deterministic construction missed
-         (clock skew, family edge cases) at the cost of more requests.
+      2. Broad scan of gamma /events (closed=false, order=createdAt desc),
+         pattern filtered. Catches anything the deterministic construction
+         missed (clock skew, family edge cases) at the cost of more requests.
+
+    NOTE on `/markets?closed=false&order=endDate&ascending=false` (also
+    named in the original brief as a discovery source): live-tested and
+    NOT used here — it surfaces long-dated markets (observed: 2028/2029
+    yearly prediction markets) that dominate that sort order, returning
+    zero BTC Up/Down matches even after scanning 500 offset. `GammaClient
+    .get_markets_page` is kept available for ad hoc use, but discovery
+    relies on slug construction + the /events scan above, which were
+    verified live to reliably surface all current BTC markets.
     """
     families = config.families()
     disc_cfg = config.discovery_cfg

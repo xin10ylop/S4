@@ -124,6 +124,32 @@ class BinanceOracle:
             log.warning("binance klines_1h failed: %s", exc)
             return []
 
+    def price_at_second(self, ts: int) -> Optional[float]:
+        """Authoritative Binance price at a specific unix second, via the 1s
+        kline REST endpoint (works even if our local rolling series doesn't
+        cover that second, e.g. bot started mid-window). Uses the kline's
+        open price (price at the start of that second).
+        """
+        try:
+            resp = self._session.get(
+                f"{self._base}/api/v3/klines",
+                params={
+                    "symbol": self._symbol,
+                    "interval": "1s",
+                    "startTime": int(ts * 1000),
+                    "limit": 1,
+                },
+                timeout=5,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("binance price_at_second failed: %s", exc)
+            return None
+        if not rows:
+            return None
+        return float(rows[0][1])  # open price
+
     def hour_open_close(self, window_start_ts: int) -> Tuple[Optional[float], Optional[float]]:
         """Open/close for the 1H candle starting at window_start_ts (unix secs).
 

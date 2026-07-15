@@ -60,6 +60,7 @@ strategy:
     settle_edge_min: 0.02     # 1 - price - fee(price) must exceed this
     price_max: 0.99
     distance_guard_usd: 3.0   # for families without a true Chainlink oracle: skip closes closer than this
+    empty_streak_stop: 5      # stop re-sweeping a market after N consecutive empty-book attempts (book was bulk-cancelled)
 
 sizing:
   per_event_cap_usd: 25       # paper default; also used as live default until scaled up
