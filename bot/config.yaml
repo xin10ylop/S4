@@ -60,6 +60,9 @@ strategy:
     price_min: 0.30           # only take asks in (price_min, price_max)
     price_max: 0.99
     vol_window_secs: 120      # rolling window for 1s log-return std
+    sigma_1s_floor: 8.0e-06   # vol floor: quiet/stale polling underestimates vol -> false certainty
+    fair_cap: 0.98            # model certainty saturates here; a Gaussian on polled 1s data
+                              # cannot distinguish 99% from 99.9999% (fat-tail protection)
   settle_sweep:
     settle_delay_secs: 2      # wait after close before sweeping (oracle/print publish lag)
     settle_window_secs: 120   # stop sweeping after this many seconds post-close
@@ -76,6 +79,9 @@ execution:
   latency_ms: 1500            # simulated reaction latency before re-fetching the book to fill against
   order_book_poll_secs: 1.0   # REST /book poll interval when WSS is not used
   use_websocket: false        # off by default; REST polling is the default, verified path
+  max_walk_above_best: 0.03   # never chase ask levels more than this above the best ask —
+                              # the research validated top-of-book fills only (first live paper
+                              # loss came partly from walking 10c+ deep on a saturated fair)
 
 resolution:
   gamma_poll_secs: 15         # how often to poll gamma for closed/resolved status on open positions

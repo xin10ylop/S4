@@ -30,10 +30,21 @@ class TestWalkAsks(unittest.TestCase):
     def test_stops_at_first_unprofitable_level(self):
         asks = [BookLevel(0.10, 100), BookLevel(0.50, 100), BookLevel(0.95, 100)]
         # edge_min chosen so 0.10 and 0.50 pass, 0.95 does not
+        # (max_above_best=None: this test targets the edge cutoff, not the slippage bound)
         result = walk_asks(asks, self.edge_fn, edge_min=0.10, price_min=0.0, price_max=0.99,
-                            cap_usd=1_000_000, fee_rate=self.fee_rate)
+                            cap_usd=1_000_000, fee_rate=self.fee_rate, max_above_best=None)
         prices = [f.price for f in result.fills]
         self.assertEqual(prices, [0.10, 0.50])
+
+    def test_slippage_bound_stops_deep_walk(self):
+        # default bound (3c): may not chase levels far above the best ask even
+        # when the edge test would allow them (first live paper loss came from
+        # a saturated fair value licensing a 10c+ deep walk)
+        asks = [BookLevel(0.60, 10), BookLevel(0.62, 10), BookLevel(0.70, 100)]
+        result = walk_asks(asks, self.edge_fn, edge_min=0.01, price_min=0.0, price_max=0.99,
+                            cap_usd=1_000_000, fee_rate=self.fee_rate, max_above_best=0.03)
+        prices = [f.price for f in result.fills]
+        self.assertEqual(prices, [0.60, 0.62])
 
     def test_respects_notional_cap_exactly(self):
         asks = [BookLevel(0.20, 1000)]

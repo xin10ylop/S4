@@ -75,6 +75,7 @@ def walk_asks(
     price_max: float,
     cap_usd: float,
     fee_rate: float,
+    max_above_best: Optional[float] = 0.03,
 ) -> WalkResult:
     """Walk a price-ascending ask ladder, consuming every level that clears
     the edge test, until the notional budget (`cap_usd`) is exhausted or a
@@ -85,13 +86,24 @@ def walk_asks(
     1-price-fee) at that price; we stop at the first level where
     edge_fn(price) <= edge_min (levels only get worse as price rises for a
     buy, so first failure means stop, not skip-and-continue).
+
+    `max_above_best` bounds how far above the best (first eligible) ask the
+    walk may chase. The research backtests validated fills at the top of the
+    book only; letting a saturated fair value license levels 20-30c deeper
+    was never validated (and hurt on the first live paper trade). None
+    disables the bound.
     """
     result = WalkResult()
     remaining_usd = cap_usd
+    best_price: Optional[float] = None
     for lvl in asks:
         if remaining_usd <= 0:
             break
         if not (price_min < lvl.price < price_max):
+            break
+        if best_price is None:
+            best_price = lvl.price
+        elif max_above_best is not None and lvl.price > best_price + max_above_best + 1e-9:
             break
         edge = edge_fn(lvl.price)
         if edge <= edge_min:
@@ -142,6 +154,7 @@ def execute_taker_signal(
     latency_ms: int,
     book_at_signal: Optional[OrderBook] = None,
     sleep: bool = True,
+    max_above_best: Optional[float] = 0.03,
 ) -> FillAttempt:
     """Simulate the full signal -> latency -> re-fetch -> fill pipeline for one attempt.
 
@@ -168,7 +181,8 @@ def execute_taker_signal(
             latency_ms=latency_ms, book_at_signal=book_at_signal, book_at_fill=book,
             walk=WalkResult(), edge_min=edge_min, outcome="empty_book",
         )
-    walk = walk_asks(book.asks, edge_fn, edge_min, price_min, price_max, cap_usd, fee_rate)
+    walk = walk_asks(book.asks, edge_fn, edge_min, price_min, price_max, cap_usd, fee_rate,
+                     max_above_best=max_above_best)
     outcome = "filled" if walk.total_shares > 0 else "book_moved_no_edge"
     return FillAttempt(
         token_id=token_id, side=side, signal_time=signal_time, fill_time=fill_time,

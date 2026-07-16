@@ -79,9 +79,18 @@ def evaluate_close_snipe(
     tau = close_ts - now_ts
     if tau <= 0:
         return None
+    # vol floor: quiet periods + REST-poll repeats underestimate realized vol,
+    # which inflates |z| and manufactures false certainty. Floor it.
+    sigma_1s = max(sigma_1s, float(cfg.get("sigma_1s_floor", 8e-6)))
     fair_up = fair_value_up(S_t, S_open, sigma_1s, tau)
     if fair_up is None:
         return None
+    # certainty cap: a Gaussian on 120s of polled prices cannot distinguish
+    # 99% from 99.9999%; real last-seconds BTC returns are fat-tailed (a live
+    # 7-sigma jump against "fair=1.0000" cost the first paper trade). Never
+    # let the model claim more than fair_cap.
+    fair_cap = float(cfg.get("fair_cap", 0.98))
+    fair_up = min(max(fair_up, 1.0 - fair_cap), fair_cap)
     fair_down = 1.0 - fair_up
 
     edge_min = float(cfg["edge_min"])

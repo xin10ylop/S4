@@ -109,12 +109,16 @@ class ExecutionRouter:
         LIVE: places one real FAK (fill-and-kill / IOC) taker order sized off
         a fresh book walk. See module docstring for verification status.
         """
+        max_above_best = self.config.execution_cfg.get("max_walk_above_best", 0.03)
+        if max_above_best is not None:
+            max_above_best = float(max_above_best)
         if self.is_live():
             return self._place_live_order(token_id, side, edge_fn, edge_min, price_min,
-                                           price_max, cap_usd)
+                                           price_max, cap_usd, max_above_best)
         return execute_taker_signal(
             self.clob_rest, token_id, side, edge_fn, edge_min, price_min, price_max, cap_usd,
             self.config.fee_rate, latency_ms, book_at_signal=book_at_signal, sleep=True,
+            max_above_best=max_above_best,
         )
 
     def _get_live_client(self):
@@ -170,6 +174,7 @@ class ExecutionRouter:
     def _place_live_order(
         self, token_id: str, side: str, edge_fn: Callable[[float], float], edge_min: float,
         price_min: float, price_max: float, cap_usd: float,
+        max_above_best: Optional[float] = 0.03,
     ) -> FillAttempt:
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
@@ -198,7 +203,7 @@ class ExecutionRouter:
         # between our GET /book and the order reaching the matching engine)
         # and cancels the remainder, so over-sizing the limit is safe.
         walk = walk_asks(book.asks, edge_fn, edge_min, price_min, price_max, cap_usd,
-                          self.config.fee_rate)
+                          self.config.fee_rate, max_above_best=max_above_best)
         if walk.total_shares <= 0:
             return FillAttempt(token_id=token_id, side=side, signal_time=signal_time,
                                 fill_time=time.time(), latency_ms=0, book_at_signal=book,
