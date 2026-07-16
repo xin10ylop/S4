@@ -1,0 +1,9 @@
+[Unit]
+Description=Run polybot watchdog periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

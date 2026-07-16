@@ -1,0 +1,6 @@
+[Unit]
+Description=polybot watchdog - restart polybot if it hangs or dies silently
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /root/S4/bot/scripts/polybot-watchdog.sh

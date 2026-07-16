@@ -2,6 +2,7 @@
 Description=polybot - Polymarket BTC Up/Down paper/live trading bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,8 +11,10 @@ WorkingDirectory=/root/S4/bot
 EnvironmentFile=-/root/S4/bot/.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/root/S4/bot/venv/bin/python -m polybot.main run
-Restart=on-failure
+Restart=always
 RestartSec=5
+OOMScoreAdjust=-500
+MemoryHigh=200M
 StandardOutput=append:/root/S4/bot/data/polybot.service.log
 StandardError=append:/root/S4/bot/data/polybot.service.log
 

@@ -85,6 +85,12 @@ systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
 
+echo "-> installing watchdog (restarts polybot if it hangs or dies silently)"
+cp scripts/polybot-watchdog.service /etc/systemd/system/polybot-watchdog.service
+cp scripts/polybot-watchdog.timer /etc/systemd/system/polybot-watchdog.timer
+systemctl daemon-reload
+systemctl enable --now polybot-watchdog.timer
+
 sleep 2
 echo
 echo "== systemctl status =="
