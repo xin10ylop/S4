@@ -42,6 +42,35 @@ def fair_value_up(S_t: float, S_open: float, sigma_1s: float, tau_secs: float) -
     return normal_cdf(z)
 
 
+def snipe_tau_bounds(cfg: dict, latency_ms: int) -> Tuple[float, float]:
+    """(tau_lo, tau_hi): the seconds-to-close band in which close_snipe may fire.
+
+    tau_hi (`snipe_last_secs`) bounds how EARLY we trade. `fair` is computed at
+    signal time and frozen for the fill, so an early signal carries stale-fair
+    risk that grows with the per-trade clip. Measured on 1,738 OOS 1h closes
+    (audit/A4_change_spec.md Part 1c): at per_event_cap_usd=$250 every losing
+    trade in the old (0, 6] window came from tau >= 5, worst single trade
+    -$258.75; restricting to [2, 5] moves that to -$45.26 while RAISING mean
+    P&L. At the old $25 clip the two are statistically indistinguishable.
+
+    tau_lo bounds how LATE. An order that arrives at or after the close can
+    never fill (the book is bulk-cancelled) and, in LIVE mode, would be a real
+    FAK order sent into a closed market. Measured: tau=1 signals filled 0 times
+    out of 46, 42 of them on an empty book. It is therefore derived from the
+    real signal->fill gap, not hardcoded, so it tracks `latency_ms`.
+
+    Backward compatible: a config.yaml predating this change (no
+    `snipe_min_tau_secs` / `snipe_fill_margin_secs`) still yields [2.0, 6.0]
+    rather than crashing.
+    """
+    tau_hi = float(cfg["snipe_last_secs"])
+    tau_lo = max(
+        float(cfg.get("snipe_min_tau_secs", 2.0)),
+        latency_ms / 1000.0 + float(cfg.get("snipe_fill_margin_secs", 0.5)),
+    )
+    return tau_lo, tau_hi
+
+
 @dataclass
 class SnipeSignal:
     market_slug: str

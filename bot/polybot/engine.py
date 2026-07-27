@@ -25,7 +25,8 @@ from .logging_setup import get_logger
 from .oracle import BinanceOracle
 from .polymarket import ClobClientREST, GammaClient, Market, discover_markets
 from .status_server import StatusState, make_server, write_status_loop
-from .strategy import evaluate_close_snipe, resolve_winner, settle_sweep_target
+from .strategy import (evaluate_close_snipe, resolve_winner, settle_sweep_target,
+                       snipe_tau_bounds)
 
 log = get_logger("engine")
 
@@ -65,6 +66,14 @@ class Engine:
         log.info("starting engine: mode=%s", "PAPER" if self.config.paper else "LIVE")
         if not self.config.paper:
             log.warning("LIVE MODE IS ARMED — real orders may be placed")
+        _tl, _th = snipe_tau_bounds(self.config.snipe_cfg,
+                                    int(self.config.execution_cfg["latency_ms"]))
+        log.info("close_snipe window: tau in [%.2f, %.2f]s (latency_ms=%s)",
+                 _tl, _th, self.config.execution_cfg["latency_ms"])
+        if _tl >= _th:
+            log.warning("close_snipe window is EMPTY (tau_lo=%.2f >= tau_hi=%.2f) — the bot "
+                        "will never fire a snipe. Check strategy.close_snipe.snipe_last_secs "
+                        "vs execution.latency_ms.", _tl, _th)
 
         self._http_server = make_server(self.config.status_json_path, self.config.http_port)
         http_thread = threading.Thread(target=self._http_server.serve_forever, daemon=True,
@@ -194,9 +203,11 @@ class Engine:
     # --------------------------------------------------------- close_snipe
     def _maybe_snipe(self, market: Market, now: float) -> None:
         cfg = self.config.snipe_cfg
-        snipe_last = float(cfg["snipe_last_secs"])
+        tau_lo, tau_hi = snipe_tau_bounds(cfg, int(self.config.execution_cfg["latency_ms"]))
         tau = market.close_ts - now
-        if not (0 < tau <= snipe_last):
+        # tau_lo is NOT a "too late, give up" case we can log usefully — it is
+        # simply outside the tradeable band, same as tau > tau_hi.
+        if not (tau_lo <= tau <= tau_hi):
             return
         if market.slug in self.snipe_done:
             return
@@ -303,7 +314,13 @@ class Engine:
         if wd.winner is None:
             return  # ambiguous / unresolved this tick; will retry next tick until window closes
 
-        cap_usd = float(self.config.sizing_cfg["per_event_cap_usd"])
+        # settle_sweep gets its OWN clip. `sizing.per_event_cap_usd` was raised to
+        # $250 for close_snipe on close_snipe evidence only (audit/A4_change_spec.md
+        # Part 2 iii); settle_sweep has never filled and must not silently inherit
+        # a 10x clip if it is ever re-enabled. Falls back to the shared cap when
+        # `strategy.settle_sweep.cap_usd` is absent (backward compatible).
+        cap_usd = float(self.config.settle_cfg.get(
+            "cap_usd", self.config.sizing_cfg["per_event_cap_usd"]))
         invested = self.ledger.strategy_cost_for_market(market.slug, "settle_sweep")
         remaining = cap_usd - invested
         if remaining <= 0.5:  # not worth another attempt

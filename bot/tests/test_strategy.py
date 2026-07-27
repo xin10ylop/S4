@@ -19,8 +19,11 @@ class FakeMarket:
     close_ts: float = 1_000_000.0
 
 
-CFG = {"snipe_last_secs": 6, "edge_min": 0.05, "price_min": 0.30, "price_max": 0.99,
-       "vol_window_secs": 120}
+# Mirrors the shipped bot/config.yaml (audit/A4_change_spec.md). Note that
+# evaluate_close_snipe never reads the window keys — the tau gate lives in
+# engine._maybe_snipe (see tests/test_snipe_window.py, tests/test_engine_gating.py).
+CFG = {"snipe_last_secs": 5, "snipe_min_tau_secs": 2.0, "snipe_fill_margin_secs": 0.5,
+       "edge_min": 0.03, "price_min": 0.30, "price_max": 0.99, "vol_window_secs": 120}
 
 
 class TestFairValueUp(unittest.TestCase):

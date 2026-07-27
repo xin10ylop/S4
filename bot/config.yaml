@@ -27,7 +27,14 @@ families:
     duration_secs: 3600
     oracle: binance          # 1h resolves on Binance BTC/USDT 1H candle
     close_snipe: true        # PRIMARY strategy — default ON for 1h only
-    settle_sweep: true
+    # OFF as of A4: 10 days live produced 1,235 signals and 1,235 empty_book —
+    # ZERO fills. The post-close book is bulk-cancelled and does not repopulate
+    # (docs/05_clob_api_spec.md), so this is pure logging + ~5 wasted REST book
+    # fetches per hourly close. `empty_streak_stop: 5` was already capping it at
+    # 5 attempts/market (1,235 / 238 closes = 5.2), i.e. the guard worked and the
+    # strategy still has no edge to guard. Do NOT re-enable without evidence the
+    # book survives the close.
+    settle_sweep: false
   # settle_sweep for the Chainlink families is OFF after live paper evidence
   # (2026-07-15, first 4.5h of deployment): 358 sweep attempts -> the only 3
   # fills were ALL Binance-vs-Chainlink disagreement cases and ALL lost
@@ -55,8 +62,21 @@ families:
 
 strategy:
   close_snipe:
-    snipe_last_secs: 6       # fire in the last N seconds before close
-    edge_min: 0.05            # fair - ask - fee(ask) must exceed this
+    # Snipe window is tau in [tau_lo, snipe_last_secs], where
+    #   tau_lo = max(snipe_min_tau_secs, latency_ms/1000 + snipe_fill_margin_secs).
+    # Measured on 1,738 OOS 1h closes — see audit/A4_change_spec.md Part 1.
+    snipe_last_secs: 5           # was 6. Upper tau bound: how EARLY we may fire.
+                                 # tau=6 signals carry 6s of unresolved BTC risk against a
+                                 # `fair` frozen at signal time; at a $250 clip every large
+                                 # loss came from there (worst single trade -$258.75).
+    snipe_min_tau_secs: 2.0      # NEW. Floor on the lower tau bound.
+    snipe_fill_margin_secs: 0.5  # NEW. Required slack between order arrival and the close.
+                                 # tau=1 signals filled 0/46 times (42 hit an empty book);
+                                 # in LIVE that is a real order sent into a closed market.
+    edge_min: 0.03            # was 0.05. fair - ask - fee(ask) must exceed this.
+                              # +22% fills / +11% P&L in the [2,5] window (A4 Part 2 ii).
+                              # Also the per-level cutoff for the fill walk; still bounded
+                              # by execution.max_walk_above_best — do NOT add a second knob.
     price_min: 0.30           # only take asks in (price_min, price_max)
     price_max: 0.99
     vol_window_secs: 120      # rolling window for 1s log-return std
@@ -70,10 +90,24 @@ strategy:
     price_max: 0.99
     distance_guard_usd: 3.0   # for families without a true Chainlink oracle: skip closes closer than this
     empty_streak_stop: 5      # stop re-sweeping a market after N consecutive empty-book attempts (book was bulk-cancelled)
+    cap_usd: 25               # settle_sweep's OWN per-event clip. sizing.per_event_cap_usd was
+                              # raised to $250 on close_snipe evidence only; settle_sweep has
+                              # never filled and must not inherit that if it is re-enabled.
 
 sizing:
-  per_event_cap_usd: 25       # paper default; also used as live default until scaled up
-  max_open_notional: 250      # global cap across all concurrently open paper/live positions
+  # $25 -> $250 measured at ~5x P&L on 1,738 OOS closes (docs/06 sec.4; independently
+  # reproduced in audit/A4_change_spec.md Part 1c). REQUIRES the [2.0, 5.0] snipe window
+  # from change (i): in the old (0, 6] window the same cap produces a -$258.75 worst trade
+  # and P&L that PEAKS at $250 then falls ($473 at $500, $28 at $1000).
+  # PAPER-only for now: docs/06 sec.8 sets the live go/no-go at ~20 resolved trades and
+  # $25-50 to start. Do NOT carry $250 into LIVE on the strength of the backtest alone.
+  per_event_cap_usd: 250
+  # `_would_exceed_global_cap` is a "stop opening new positions" gate evaluated BEFORE the
+  # new trade is sized (engine.py uses `>=` on current open notional), so the true ceiling
+  # is max_open_notional + per_event_cap_usd = $1250. 1h positions resolve within ~1-2 min
+  # of close via the gamma poll, so real concurrency is ~1; $1000 is ~4 clips of headroom
+  # and leaves room for a second family later.
+  max_open_notional: 1000
 
 execution:
   latency_ms: 1500            # simulated reaction latency before re-fetching the book to fill against

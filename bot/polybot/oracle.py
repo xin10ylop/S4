@@ -5,26 +5,28 @@ Binance is both a *portable* and *authoritative* oracle for that family: it's
 reachable from anywhere (via data-api.binance.vision) and matches the actual
 resolution source.
 
-Short families (5m/15m/4h) resolve on a Chainlink BTC/USD print. We do not
-have a wired Chainlink feed in this build (see ChainlinkOracle below — a
-documented, honest stub). Per the strategy spec, close_snipe for those
-families therefore stays OFF until a Chainlink oracle is configured; we do NOT
-substitute Binance as a signal source for short-family snipe (basis risk).
-settle_sweep for short families is allowed to use the Binance price only as a
-*distance-guarded* winner check (see strategy.py), which is a materially
-different, safer use than using it as a fair-value input.
+Short families (5m/15m/4h) resolve on the Chainlink BTC/USD **Data Streams**
+report (NOT the on-chain aggregator). That feed is now wired — see
+`ChainlinkOracle` below. Provenance and every number quoted in that class are
+from `audit/A1_chainlink.md`.
+
+The two oracle classes expose the same read interface (`poll_once`, `latest`,
+`price_at_or_before`, `rolling_log_return_std`, `price_at_second`) so the
+engine can use either one for a family without branching on the read path.
 """
 from __future__ import annotations
 
 import collections
+import json
 import math
+import threading
 import time
 from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Optional, Tuple
 
 from .config import Config
 from .logging_setup import get_logger
-from .net import get_session
+from .net import ca_bundle_path, get_session, ssl_context
 
 log = get_logger("oracle")
 

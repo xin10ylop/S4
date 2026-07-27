@@ -1,0 +1,271 @@
+"""Engine-level gating tests for the close_snipe timing band and sizing.
+
+These exercise `Engine._maybe_snipe` / `Engine._tick` as *wired* (config ->
+snipe_tau_bounds -> gate -> executor.submit), with every network-touching
+collaborator replaced by a stub. Nothing here opens a socket.
+
+Guards audit/A4_change_spec.md changes (i) window, (iii) cap, (iv) settle off.
+"""
+import inspect
+import sys
+import tempfile
+import unittest
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import yaml
+
+from polybot.config import Config
+from polybot.engine import Engine
+from polybot.oracle import PricePoint
+from polybot.polymarket import BookLevel, OrderBook
+
+CONFIG_YAML = Path(__file__).resolve().parent.parent / "config.yaml"
+
+
+@dataclass
+class FakeMarket:
+    slug: str = "bitcoin-up-or-down-july-15-2026-3pm-et"
+    family: str = "1h"
+    up_token_id: str = "UP"
+    down_token_id: str = "DOWN"
+    close_ts: float = 1_000_000.0
+    accepting_orders: bool = True
+    closed: bool = False
+
+    @property
+    def window_start_ts(self) -> int:
+        return int(self.close_ts - 3600)
+
+
+class StubBinance:
+    """Deterministic oracle: price well above the window open, modest vol, so
+    fair_up saturates at fair_cap and a 0.50 ask is a clear mispricing."""
+
+    def __init__(self, now: float, s_t: float = 101_000.0, s_open: float = 100_000.0,
+                 staleness: float = 0.0, sigma: float = 1e-4):
+        self._pt = PricePoint(ts=now - staleness, price=s_t)
+        self._s_open = s_open
+        self._sigma = sigma
+
+    def hour_open_close(self, window_start_ts):
+        return self._s_open, None
+
+    def latest(self):
+        return self._pt
+
+    def rolling_log_return_std(self, window_secs):
+        return self._sigma
+
+
+class StubClob:
+    def __init__(self, ask_up: Optional[float] = 0.50, ask_down: Optional[float] = 0.50):
+        self._asks = {"UP": ask_up, "DOWN": ask_down}
+        self.calls: List[str] = []
+
+    def get_book(self, token_id):
+        self.calls.append(token_id)
+        px = self._asks.get(token_id)
+        if px is None:
+            return None
+        return OrderBook(token_id=token_id, bids=[],
+                         asks=[BookLevel(px, 5000.0)], fetched_at=0.0)
+
+
+class StubLedger:
+    def __init__(self):
+        self.snipe_signals: List[object] = []
+        self.settle_signals: List[tuple] = []
+        self.open_notional = 0.0
+
+    def record_snipe_signal(self, sig):
+        self.snipe_signals.append(sig)
+        return len(self.snipe_signals)
+
+    def record_settle_signal(self, *a, **kw):
+        self.settle_signals.append((a, kw))
+        return len(self.settle_signals)
+
+    def total_open_notional(self):
+        return self.open_notional
+
+    def strategy_cost_for_market(self, *_):
+        return 0.0
+
+    def unresolved_markets(self):
+        return []
+
+    def all_open_positions(self):
+        return []
+
+
+@dataclass
+class StubExecutor:
+    """Captures submit() instead of running the fill worker."""
+    submissions: List[tuple] = field(default_factory=list)
+
+    def submit(self, fn, *args, **kwargs):
+        self.submissions.append((fn, args, kwargs))
+        return None
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def _make_engine(tmpdir: str, **raw_overrides) -> Engine:
+    """Engine against the SHIPPED config.yaml, with storage/logging redirected
+    to a temp dir so tests never touch bot/data/."""
+    with open(CONFIG_YAML) as f:
+        raw = yaml.safe_load(f)
+    raw["storage"] = {
+        "sqlite_path": str(Path(tmpdir) / "t.db"),
+        "fills_csv": str(Path(tmpdir) / "fills.csv"),
+        "pnl_csv": str(Path(tmpdir) / "pnl.csv"),
+    }
+    raw["logging"] = dict(raw["logging"], file=str(Path(tmpdir) / "t.log"))
+    for k, v in raw_overrides.items():
+        raw[k] = v
+    eng = Engine(Config(raw=raw, path=CONFIG_YAML))
+    eng.ledger = StubLedger()
+    eng.executor = StubExecutor()
+    return eng
+
+
+class _EngineTestBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.now = 1_000_000.0
+        self.engine = _make_engine(self._tmp.name)
+        self.engine.binance = StubBinance(self.now)
+        self.engine.clob = StubClob()
+
+    def _market_at_tau(self, tau: float, slug: str = "m1") -> FakeMarket:
+        return FakeMarket(slug=slug, close_ts=self.now + tau)
+
+    @property
+    def submissions(self):
+        return self.engine.executor.submissions
+
+
+class TestSnipeWindowGate(_EngineTestBase):
+    def test_no_fire_above_window(self):
+        # tau_hi = snipe_last_secs = 5
+        self.engine._maybe_snipe(self._market_at_tau(5.6), self.now)
+        self.assertEqual(self.submissions, [])
+        self.assertEqual(self.engine.ledger.snipe_signals, [])
+        self.assertEqual(self.engine.clob.calls, [])  # gated before any book fetch
+
+    def test_no_fire_below_window(self):
+        # THE bug this change exists to fix: tau=1.9 fills at/after the close.
+        self.engine._maybe_snipe(self._market_at_tau(1.9), self.now)
+        self.assertEqual(self.submissions, [])
+        self.assertEqual(self.engine.ledger.snipe_signals, [])
+        self.assertEqual(self.engine.clob.calls, [])
+
+    def test_no_fire_at_legacy_tau_values(self):
+        # The old gate was (0, 6]; every tau it admitted that the new one does
+        # not must now be silent.
+        for tau in (0.02, 0.5, 1.0, 1.5, 5.5, 6.0):
+            self.engine.snipe_done.clear()
+            self.engine._maybe_snipe(self._market_at_tau(tau), self.now)
+        self.assertEqual(self.submissions, [])
+
+    def test_fires_inside_window(self):
+        m = self._market_at_tau(3.0)
+        self.engine._maybe_snipe(m, self.now)
+        self.assertEqual(len(self.submissions), 1)
+        self.assertIn(m.slug, self.engine.snipe_done)
+        self.assertEqual(len(self.engine.ledger.snipe_signals), 1)
+
+    def test_fires_at_band_edges(self):
+        for i, tau in enumerate((2.0, 5.0)):
+            m = self._market_at_tau(tau, slug=f"edge{i}")
+            self.engine._maybe_snipe(m, self.now)
+        self.assertEqual(len(self.submissions), 2)
+
+    def test_one_entry_per_window(self):
+        m4 = self._market_at_tau(4.0, slug="same")
+        m3 = self._market_at_tau(3.0, slug="same")
+        # same slug, two ticks inside the band
+        self.engine._maybe_snipe(m4, self.now)
+        self.engine._maybe_snipe(m3, self.now + 1.0)
+        self.assertEqual(len(self.submissions), 1)
+
+    def test_stale_oracle_skips(self):
+        self.engine.binance = StubBinance(self.now, staleness=6.0)
+        self.engine._maybe_snipe(self._market_at_tau(3.0), self.now)
+        self.assertEqual(self.submissions, [])
+
+    def test_non_1h_family_still_blocked(self):
+        m = FakeMarket(slug="btc-updown-5m-1", family="5m", close_ts=self.now + 3.0)
+        self.engine._maybe_snipe(m, self.now)
+        self.assertEqual(self.submissions, [])
+
+    def test_window_tracks_latency_ms(self):
+        """Raising latency_ms lifts the floor, so a tau that used to fire stops."""
+        eng = _make_engine(self._tmp.name)
+        eng.config.raw["execution"]["latency_ms"] = 3000  # floor -> 3.5s
+        eng.binance = StubBinance(self.now)
+        eng.clob = StubClob()
+        eng._maybe_snipe(FakeMarket(slug="a", close_ts=self.now + 3.0), self.now)
+        self.assertEqual(eng.executor.submissions, [])
+        eng._maybe_snipe(FakeMarket(slug="b", close_ts=self.now + 4.0), self.now)
+        self.assertEqual(len(eng.executor.submissions), 1)
+
+
+class TestSizingAndSettleWiring(_EngineTestBase):
+    def _bound_fill_args(self):
+        fn, args, kwargs = self.submissions[0]
+        return inspect.signature(self.engine._run_fill).bind(*args, **kwargs).arguments
+
+    def test_cap_passed_to_fill_is_config_value(self):
+        self.engine._maybe_snipe(self._market_at_tau(3.0), self.now)
+        bound = self._bound_fill_args()
+        self.assertEqual(bound["cap_usd"],
+                         float(self.engine.config.sizing_cfg["per_event_cap_usd"]))
+        self.assertEqual(bound["cap_usd"], 250.0)  # (iii) shipped value
+        self.assertEqual(bound["edge_min"],
+                         float(self.engine.config.snipe_cfg["edge_min"]))
+        self.assertEqual(bound["strategy"], "close_snipe")
+
+    def test_global_cap_still_blocks_fills(self):
+        self.engine.ledger.open_notional = 10_000.0
+        self.engine._maybe_snipe(self._market_at_tau(3.0), self.now)
+        # the signal is still recorded, but no fill is dispatched
+        self.assertEqual(len(self.engine.ledger.snipe_signals), 1)
+        self.assertEqual(self.submissions, [])
+
+    def test_settle_sweep_off_for_1h(self):
+        """(iv) at the wiring level: a post-close 1h market never reaches
+        _maybe_settle when _tick runs against the shipped config."""
+        called = []
+        self.engine._maybe_settle = lambda m, n: called.append(m.slug)
+        post_close = FakeMarket(slug="closed1h", close_ts=self.now - 10.0)
+        self.engine.markets = {post_close.slug: post_close}
+        self.engine._tick()
+        self.assertEqual(called, [])
+        self.assertFalse(self.engine.config.families()["1h"].settle_sweep)
+
+    def test_settle_sweep_has_its_own_cap(self):
+        """If settle_sweep is ever re-enabled it must NOT inherit the $250
+        close_snipe clip (engine reads strategy.settle_sweep.cap_usd)."""
+        eng = _make_engine(self._tmp.name)
+        eng.binance = StubBinance(self.now)
+        eng.clob = StubClob()
+        eng.config.raw["families"]["1h"]["settle_sweep"] = True
+        eng.settle_winner_cache["s1"] = type("W", (), {"winner": "up", "reason": "t",
+                                                       "s_open": 1.0, "s_close": 2.0})()
+        eng._maybe_settle(FakeMarket(slug="s1", close_ts=self.now - 5.0), self.now)
+        self.assertEqual(len(eng.executor.submissions), 1)
+        bound = inspect.signature(eng._run_fill).bind(
+            *eng.executor.submissions[0][1], **eng.executor.submissions[0][2]).arguments
+        self.assertEqual(bound["cap_usd"], 25.0)
+        self.assertLess(bound["cap_usd"], float(eng.config.sizing_cfg["per_event_cap_usd"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
