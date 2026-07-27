@@ -311,10 +311,17 @@ def stage_binance(days, coins, workers):
 def stage_verify(days, coins):
     """Re-derive Up/Down from the fetched Binance 1s bars; compare to result_id.
 
-    This is the safety gate.  The hourly candle open is the FIRST trade at or
-    after open_s and the close is the LAST trade at or before close_s (Binance
-    kline semantics on a [open, close) hour).  A coin that does not reconcile
-    at ~100% is wired to the wrong feed and must NOT be traded.
+    This is the safety gate.  A coin that does not reconcile at ~100% is wired
+    to the wrong feed and must NOT be traded.
+
+    ANCHOR (this is subtle and got it wrong once): Binance's 1H candle open is
+    the first *traded* price in [open, close) and its close is the last traded
+    price.  The 1s-kline archive back-fills seconds with NO trades by carrying
+    the previous close at volume 0.  Taking the bar that merely sits at open_s
+    therefore returns the carried price, not the hour's first trade, and it
+    disagreed with the real 1H candle on 3 of 5,873 hours -- every one of them
+    a case where the hour opened on an empty second.  Only bars with
+    volume > 0 are real prints, so the anchors are taken from those.
     """
     mk = load_markets()
     mk = mk[(mk.status == "resolved") & mk.d.isin(set(days)) & mk.coin.isin(coins)]
@@ -336,24 +343,28 @@ def stage_verify(days, coins):
             rows.append((coin, sym, 0, 0, float("nan"), "no binance data"))
             continue
         k = pd.concat(frames, ignore_index=True).sort_values("ts_ms")
+        k = k[k.volume > 0]                                # real prints only
         ts = k.ts_ms.to_numpy()
         op, cl = k.open.to_numpy(), k.close.to_numpy()
-        n = agree = nodata = 0
+        n = agree = nodata = ties = 0
         for r in sub.itertuples():
             lo, hi = r.open_s * 1000, r.close_s * 1000
-            i = np.searchsorted(ts, lo, "left")            # first bar at/after open
-            j = np.searchsorted(ts, hi, "left") - 1        # last bar strictly before close
+            i = np.searchsorted(ts, lo, "left")            # first PRINT at/after open
+            j = np.searchsorted(ts, hi, "left") - 1        # last PRINT before close
             if i >= len(ts) or j < 0 or ts[i] >= hi or ts[j] < lo:
                 nodata += 1
                 continue
             n += 1
+            if cl[j] == op[i]:
+                ties += 1
             derived = 0 if cl[j] >= op[i] else 1           # outcome_0 == "Up"
             if derived == int(r.result_id):
                 agree += 1
         acc = agree / n if n else float("nan")
-        rows.append((coin, sym, n, nodata, acc, "OK" if acc > 0.99 else "MISMATCH"))
+        rows.append((coin, sym, n, nodata, ties, acc,
+                     "OK" if acc > 0.995 else "MISMATCH"))
     out = pd.DataFrame(rows, columns=["coin", "symbol", "n_checked", "n_nodata",
-                                      "settle_agreement", "verdict"])
+                                      "n_exact_ties", "settle_agreement", "verdict"])
     out.to_csv(f"{OUT}/verify_settle.csv", index=False)
     print(out.to_string(index=False), flush=True)
     return out

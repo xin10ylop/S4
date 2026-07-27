@@ -298,14 +298,14 @@ stack as the secondary. Report `+X¢ (t_day)` — never the per-trade t alone; i
 3. **Decision instants are integer seconds.** The live bot ticks at ~1 Hz on a drifting sub-second
    phase. `Params.tick_hz` can densify the grid; the control uses integer seconds because that is what
    the published numbers used.
-4. **`sigma_1s_floor` recalibration is still open, and 3e-5 is the wrong shape of number.** Measured
-   over 1.39 M seconds sampled across the repo's `crypto_prices`, Chainlink `sigma_1s` (bot
-   convention) runs p05 1.44e-05, p25 2.44e-05, **p50 3.52e-05**, p90 8.02e-05. So 3.0e-5 is
-   approximately the *median*, not a floor — setting the floor there would bind on **38.7%** of
-   decisions, versus 0.6% for the shipped 8e-6. A floor is meant to catch the quiet tail; a low
-   percentile (~1.4e-05) is the defensible choice. The harness exposes `--sigma-floor`; at 3e-5 on the
-   43-day sample it costs 11% of trades for +0.3 ¢/share. **Do not adopt 3e-5 without deciding whether
-   you want a floor or a recalibrated typical value — they are not the same object.**
+4. **`sigma_1s_floor` recalibration is still open, and 3e-5 is the wrong shape of number.** Chainlink
+   `sigma_1s` (bot convention) sits far below 3e-5 for a large fraction of seconds, so 3.0e-5 is
+   approximately the *median*, not a floor. A floor is meant to catch the quiet tail; a low percentile
+   is the defensible choice. The harness exposes `--sigma-floor`; at 3e-5 on the 43-day sample it costs
+   11% of trades for +0.3 ¢/share. **Do not adopt 3e-5 without deciding whether you want a floor or a
+   recalibrated typical value — they are not the same object.**
+   *(The percentiles originally quoted here were not reproducible and have been replaced by a
+   re-measurement — see §10.3.)*
 5. Two published figures in `docs/07` §3.4 need the corrections in §2.1 and §2.2 before reuse.
 
 ---
@@ -325,3 +325,95 @@ stack as the secondary. Report `+X¢ (t_day)` — never the per-trade t alone; i
 | `data/c2/table6_tape_crosscheck.csv` | bookcurves vs quotes staleness cross-check |
 | `data/c2/table7_fresh_adapter.csv` | §6 fresh-tape control |
 | `data/c2/trades_*.parquet` | per-variant trade tapes (19 variants × 43 days) |
+| `scripts/fresh5m/indep_crosscheck.py` | §10.2 second, independently-written replay used to cross-check the harness |
+
+---
+
+## 10. Independent re-verification (second pass, 2026-07-27)
+
+Everything in §1–§9 was re-run from scratch and re-checked against the raw parquet by a second agent
+that did not write the harness. **The harness passes.** Nothing in the control result changed; two
+documentation numbers were wrong and are corrected below.
+
+### 10.1 What reproduced
+
+| check | result |
+|---|---|
+| `proptest.py 20000` re-run | **0 mismatches**, all four ported functions (1,089/20,000 inputs hit the positive signal path) |
+| `replay.py control` re-run | **+8.3756¢ / t_trade 7.5635 / t_day 4.1679, 71 of 1,503 fills removed, 14.04% of P&L** |
+| shipped params re-run | **+10.8918¢ / t_trade 10.3346** |
+| `control_report.py` re-run | all **9 CSVs byte-identical** to the committed ones — the pipeline is deterministic |
+| P&L arithmetic | hand-recomputed `payout − avg − fee(avg)` on sampled fills: exact to 1e-12 |
+| day-clustered `t` | recomputed independently from the trade tape: **4.1679** (matches) |
+| `result_id == 0 ⇔ Up` | re-derived from Chainlink with the A1 backfill rule: **574/574 = 100.000%** |
+| Chainlink publish lag | re-measured: p50 1.109s, p90 1.513s, p99 1.980s, **0 negative** (A1: 1.119/1.531/2.017) |
+| book ages | the 5 largest stale fills re-derived straight from `bookcurves`: **1045.956 / 926.272 / 743.380 / 606.946 / 445.926 s — identical to the harness, and each window has no further update before its close** |
+| `latency_ms → tau_lo` | 0/1500ms → band [2.5,5.0]; 2500 → [3.0,5.0]; 3000 → [3.5,5.0] (τ grid drops to {5,4}); 5000 → **empty band**. Matches `strategy.snipe_tau_bounds` on the real config. |
+| harness defaults vs `bot/config.yaml` | `edge_min`, `price_min/max`, `sigma_1s_floor`, `fair_cap`, `snipe_last_secs`, `snipe_min_tau_secs`, `snipe_fill_margin_secs`, `fee_rate`, `latency_ms` **all match shipped** |
+
+**Stale-fill count against the published 71/1,503: exact.** The full post-hoc curve re-derived from the
+trade tape is 2s → 120 fills/19.95% of P&L · 5s → 113/18.90% · 10s → 103/17.14% · **30s → 71/14.04%** ·
+60s → 35/7.34%. Only the 30s threshold yields 71 and 14%, confirming §2.1.
+
+### 10.2 The strongest check: a second, independently-written replay
+
+`scripts/fresh5m/indep_crosscheck.py` is a ~200-line replay written from the bot's source semantics
+**without importing `replay.py`** — its own Chainlink loader, causal publication index, σ grid, strike
+rule, book tape, window gate and fill walk. Run on 5 days spanning the calm, the volatile and the
+2026-04-20 truncation episode (Apr 10, Apr 20, Apr 25, May 5, Jul 6) under the A3 control convention:
+
+```
+HARNESS: signals=275 fills=153 ev=5.4102c win=0.7190
+INDEP  : signals=275 fills=153 ev=5.4102c win=0.7190
+outer join on (day, wts): 275 both, 0 left_only, 0 right_only
+field mismatches — tau 0 · side 0 · outcome 0 · book_age_sig 0 · book_age_fil 0 ·
+                   avg_price 0 · fair 0 · shares 0 · pnl_per_share 0 · pnl 0 · won 0
+TOTAL FIELD MISMATCHES: 0  (rtol/atol 1e-9)
+```
+
+Two independent implementations agree on every decision, every book age and every cent. The control
+result is not an artifact of a single codebase.
+
+### 10.3 Corrections found
+
+1. **Caveat 4's σ percentiles were not reproducible.** Re-measured under the same "bot" convention
+   (returns between consecutive held prints, 120s window, min_periods 30):
+
+   | sample | n (seconds) | p05 | p25 | **p50** | p90 | 8e-6 binds | **3e-5 binds** |
+   |---|---|---|---|---|---|---|---|
+   | 43 control days | 3.65 M | 9.60e-06 | 1.92e-05 | **2.91e-05** | 6.53e-05 | 2.99% | **52.2%** |
+   | full repo range (116 days, Apr 2–Jul 26) | 9.72 M | 9.01e-06 | 1.86e-05 | **2.90e-05** | 6.94e-05 | 3.72% | **52.1%** |
+   | *as previously published here* | *1.39 M* | *1.44e-05* | *2.44e-05* | *3.52e-05* | *8.02e-05* | *0.6%* | *38.7%* |
+
+   The old figures are biased ~20% high on every percentile and could not be reproduced on any sample.
+   **The conclusion is unchanged and in fact stronger: 3e-5 binds on ~52% of decisions, not 38.7%, so
+   it is at/above the median and is emphatically not a floor.** The shipped 8e-6 binds on ~3.7%, not
+   0.6%. A defensible floor sits near p05 ≈ 9e-06–1.4e-05. This is a documentation error only — the
+   harness's `--sigma-floor` knob and the measured `sigfloor_3e5` stress row (1,336 fills, +9.75¢) are
+   unaffected.
+2. **`Params.per_event_cap_usd` defaults to 25.0 while `bot/config.yaml` ships 250.** Every other
+   default matches shipped, so this one is a footgun. It is deliberate (the published control was a
+   $25 clip) but the fresh run **must** pass `--cap-usd 250`, as §7's pre-committed command does.
+   Per-share EV is unaffected; `$/day` is not.
+
+### 10.4 Two approximations, both bounded and both conservative
+
+* **Fee at the average price.** P&L charges `fee(avg_price)` rather than the share-weighted mean of
+  per-level fees. Since `fee(p) = 0.07·p·(1−p)` is concave, this *overstates* the fee by `0.07·Var(p)`.
+  With the walk bounded to 3¢ above best, the worst case is **0.0016 ¢/share** — negligible and in the
+  safe direction. Zero effect on the control (0 of 1,503 fills used more than one level).
+* **`_would_exceed_global_cap` is not modelled.** The live engine stops opening at
+  `max_open_notional` $1,000. 5m closes are 5 minutes apart and resolve within ~1–2 min, so
+  concurrency is ~1 and the gate should never bind at ~20 trades/day — but at a $250 clip it is an
+  un-modelled live constraint worth re-checking if fill rate rises.
+
+### 10.5 One methodological caution carried forward
+
+PRE- and POST- staleness conventions agree to within 0.1¢ on the 43-day sample, which is a real check.
+But note the harness's PRE mode hands the evaluator `None` for a stale side, so the *other* side and
+later ticks still trade — that is the honest analogue of the live bot, and it is why PRE fill counts
+can slightly *exceed* POST at the same threshold (e.g. 2s: PRE 1,386 vs POST 1,383). Not a bug; just
+do not read the two columns as the same experiment.
+
+**Verdict: the harness is sound and ready for the fresh tape.** The pre-committed reporting in §7
+stands, with `--cap-usd 250` explicit.

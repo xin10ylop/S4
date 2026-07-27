@@ -85,12 +85,22 @@ but several June days are degraded and two are disqualifying:
 | 2026-07-07 | 83.8 % | 2,908 s | 5 holes > 120 s |
 | 2026-06-03 | 93.7 % | 3,401 s | |
 | 2026-06-04 | 94.3 % | 2,559 s | |
-| 2026-07-23 | 92.7 % | 2,811 s from 18:01:33Z | the only degraded day in the target period |
+| 2026-07-23 | 92.7 % | 2,811 s from 18:01:33Z | worst day in the target period |
+| 2026-07-24 | **94.1 %** | 387 s | **added on re-verification — also below 95 %, also in the target period** |
 
-**2026-06-10 is a publish-time trap.** 7,273 of its reports have a publish lag > 10 s, max
+**2026-06-10 is the worst publish-time trap.** 7,273 of its reports have a publish lag > 10 s, max
 **7,923 s (2.2 h)** — the vendor backfilled hours-late observations. Anything keying off
 `timestamp_us` silently imports up to ~2 h of foresight on that day. Enforcing
 `server_timestamp_us <= t` handles it correctly. That is why the rule is not optional.
+
+**Correction (re-verification): the trap is NOT confined to 2026-06-10.** 18 of 56 days carry
+reports with publish lag > 10 s, and **9 days exceed 60 s**: 06-03 (121 s), 06-08 (63 s),
+06-09 (216 s), **06-10 (7,924 s)**, 06-19 (205 s), 06-20 (191 s), **06-21 (874 s)**, 06-29 (364 s),
+and **07-24 (79 s) — inside the target period**. Four target-period days (07-11, 07-12, 07-22,
+07-24) carry lag > 10 s reports. 2026-06-21 in particular (874 s / 14.6 min trap, 860 s coverage
+hole) was not previously flagged at all. None of this is a data defect — `server_timestamp_us` is
+present and correct on every row — but it means the causality rule is load-bearing on the *fresh
+July days too*, not just on one bad June day.
 
 Per-day evaluability (both resolution boundaries present) is in `markets.parquet.evaluable`:
 target period **97.9–99.7 %**; June 06-11 51 %, 06-01 83 %, 06-05 83 %, 06-10 84 %, rest ≥ 94 %.
@@ -248,6 +258,12 @@ otherwise even cleaner than quotes: median age 0.00 s, p99 0.1–0.2 s on unaffe
 concentration — and **every episode exceeding 1400 s starts between 04:00:00 and 04:05:20 UTC**.
 That is midnight ET, Polymarket's daily rollover.
 
+*Counting convention (clarified on re-verification):* those 36 are markets whose **freeze began** in
+the 04h hour. Counting instead by the market's own **close hour** gives **33 of 76 (43.4 %)** — the
+other 3 froze at ~04:0x but closed after 05:00, because the freezes run up to 40 minutes. Both
+counts are correct under their own definition and both are a 10–11× concentration; the conclusion is
+unchanged.
+
 **Consequences.** For the backtest: drop any fill whose book age at the decision instant exceeds a
 hard threshold (20 s is generous against a clean p99 of 1.6 s); that discards 0.471 % of decision
 instants over 56 days and removes exactly the failure mode that supplied 53.6 % of A3's P&L. For any
@@ -279,7 +295,50 @@ Note the direction is not obvious in advance: *fewer* top-of-book updates could 
 (better for us) or a thinner, more adversarial book (worse). Depth from `books/` for June is what
 settles it.
 
-## 8. What is NOT here / caveats
+## 8. INDEPENDENT RE-VERIFICATION (second pass, recomputed from the parquet files)
+
+Everything in §§1–7 was re-derived from the saved files by a separate script that does **not** call
+`fetch.py`'s own coverage or outage code, so a bug in the fetcher could not confirm itself. Result:
+**every headline number reproduces exactly.**
+
+| claim | doc | recomputed | match |
+|---|---|---|---|
+| quote tapes | 32,238 | **32,238** | ✅ |
+| quote rows | 425,743,161 | **425,743,161** | ✅ |
+| frozen (age ≥ 20 s) decision instants | 152 (0.471 %) | **152 (0.471 %)** | ✅ |
+| distinct frozen markets | 76 | **76** | ✅ |
+| markets / all resolved | 16,121 / 100 % | **16,121 / 100 %** | ✅ |
+| liquidity regime, 4 periods | 196.8 / 141.3 / 55.1 / 51.1 per s | **196.8 / 141.3 / 55.1 / 51.1** | ✅ |
+| break day-by-day 06-25→06-30 | 111.7 → 79.1 → 59.0 → 50.7 | **113.6 / 111.7 / 79.1 / 59.0 / 50.7 / 53.6** | ✅ |
+| Chainlink resolution rule vs `result_id` | 99.974 % | **99.98 % (15,619 / 15,622)** | ✅ |
+| crypto schema + `server_timestamp_us` | present, never < observe | **present, 0 negative lags in 4.64 M rows** | ✅ |
+
+The **2026-07-21 episode reproduces row for row** (56.5 / 356.7 / 727.5 / 957.0 / 1477.2 / 1775.1 /
+2073.1 s, anchored at 04:05:19.758Z–04:09:00Z). This is now the *third* independent derivation of
+that outage — the original verifier, the first C1 pass, and this one. **It is settled fact.**
+
+Post-break liquidity never recovers: max **67.9 updates/s** on any day after 2026-06-28, against a
+Jun 1–26 mean of 166.9/s — a **3.23× step down**.
+
+### The publish-lag rule is worth ~$1.35 of foresight per decision, measured
+
+The causality rule was asserted in §6 but never priced. At each market's τ = 3 s decision instant I
+took `S_causal` (last report with `server_timestamp_us ≤ t`, legal) and `S_peek` (last report with
+`timestamp_us ≤ t`, illegal) and differenced them over all 16,121 markets:
+
+| | all 56 days | target 07-08..07-26 |
+|---|---|---|
+| instants where the two differ | **96.5 %** | **97.8 %** |
+| mean \|S_peek − S_causal\| | **$2.34** | **$1.35** |
+| max | $420 (06-10) | **$64** |
+
+**Keying the signal off observation time changes the BTC price used on ~97 % of decisions**, by
+$1.35 on a typical fresh-July decision. On a 5-minute at-the-money binary that is not a rounding
+error — it is ~1.1 s of future price movement handed to the strategy for free, and it is exactly the
+mechanism A1 warned would "manufacture an edge that does not exist." Any replay that reads
+`timestamp_us` instead of `server_timestamp_us` should be assumed contaminated until re-run.
+
+## 9. What is NOT here / caveats
 
 - **Quote tape is trimmed to 120 s pre-close** (books to 45 s). Anything needing the full 5-minute
   tape — e.g. modelling intra-window drift from the window open — must re-fetch. Disk, not the

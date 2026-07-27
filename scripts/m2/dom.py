@@ -238,6 +238,15 @@ class P:
     clock: str = "exchange"
     # fee_rate=None -> use the per-window fee_rate recorded in windows_all.
     per_window_fee: bool = False
+    # gate_mode: "flat"  -> require gap > gap_min (a fixed number of cents)
+    #            "fee"   -> require gap > fee(ask_lo) + fee(1-bid_hi) + gap_min.
+    #   The second is the economically correct gate: the round trip only pays if
+    #   the crossing exceeds the two taker fees, and the fee is 0.07*p*(1-p), so
+    #   it is 3.6c near p=0.5 but only 0.6c near p=0.1/0.9.  A flat 3.5c gate
+    #   throws away every cheap opportunity in the tails.
+    gate_mode: str = "flat"
+    tau_min: float = 0.0            # only consider decisions with tau in
+    tau_max: float = 1e9            # [tau_min, tau_max] seconds to close
 
 
 def _grid(t0: int, t1: int, tapes: Sequence[Tape], hz: float) -> np.ndarray:
@@ -293,7 +302,14 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     # the Down leg is reconstructed as (1 - bid_Up); charge the haircut to the
     # detected gap so a reconstruction error cannot manufacture a signal.
     gap = bid_hi - ask_lo - p.dn_haircut
-    live = ok & _valid(ask_lo) & _valid(bid_hi) & (gap > p.gap_min)
+    if p.gate_mode == "fee":
+        dn = 1.0 - bid_hi + p.dn_haircut
+        need = (fee * ask_lo * (1.0 - ask_lo) + fee * dn * (1.0 - dn)) + p.gap_min
+    else:
+        need = np.full(len(grid), p.gap_min)
+    tau_g = (close_us - grid) / 1e6
+    in_tau = (tau_g >= p.tau_min) & (tau_g <= p.tau_max)
+    live = ok & _valid(ask_lo) & _valid(bid_hi) & (gap > need) & in_tau
     sig = live & fresh if p.require_both_fresh else live
     if p.persist_ms > 0 and sig.any():
         # rs[i] = grid time at which the CURRENT unbroken `live` run began

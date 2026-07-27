@@ -132,6 +132,26 @@ def build_sets() -> Dict[str, dom.P]:
     # --- the combined 'best defensible' config ---------------------------
     S["strict"] = dom.P(gap_min=0.02, **{**BASE, "persist_ms": 500, "dn_haircut": 0.005,
                                          "clock": "local"})
+    # --- fee-aware gate: require the crossing to beat BOTH taker fees ----
+    for m in (0.0, 0.005, 0.01, 0.02):
+        S[f"feegate{int(m*1000):02d}"] = dom.P(gap_min=m,
+                                               **{**BASE, "gate_mode": "fee"})
+    S["feegate_strict"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                 "persist_ms": 500,
+                                                 "dn_haircut": 0.005,
+                                                 "clock": "local"})
+    for L in (0, 250, 500, 1000):
+        S[f"feegate10_lat{L}"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                        "latency_ms": L})
+    for c in (100.0, 250.0):
+        S[f"feegate10_clip{int(c)}"] = dom.P(gap_min=0.01, **{**BASE,
+                                                              "gate_mode": "fee",
+                                                              "clip_usd": c})
+    S["feegate10_slack50"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                    "slack_frac": 0.5})
+    # --- tau buckets (the signal set is bimodal in time-to-close) --------
+    S["tau_late"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee", "tau_max": 30.0})
+    S["tau_early"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee", "tau_min": 30.0})
     return S
 
 
