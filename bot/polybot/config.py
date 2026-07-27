@@ -79,6 +79,24 @@ class Config:
     def fee_rate(self) -> float:
         return float(self.raw["fees"]["fee_rate"])
 
+    @property
+    def chainlink_cfg(self) -> Dict[str, Any]:
+        """Chainlink Data Streams oracle settings (see oracle.ChainlinkOracle).
+
+        Every endpoint here is public and unauthenticated — there is no secret
+        to put in this dict. If a future transport ever needs a credentialled
+        URL (e.g. a paid RPC or Chainlink's own gated Data Streams API), it
+        must be supplied through the environment variable named by
+        `rpc_url_env` and NEVER written into config.yaml.
+        """
+        cfg = dict((self.raw.get("oracles", {}) or {}).get("chainlink", {}) or {})
+        onchain = dict(cfg.get("onchain_check") or {})
+        env_var = onchain.get("rpc_url_env")
+        if env_var and os.environ.get(env_var):
+            onchain["rpc_url"] = os.environ[env_var]
+            cfg["onchain_check"] = onchain
+        return cfg
+
     def families(self) -> Dict[str, FamilyConfig]:
         out = {}
         for name, d in self.raw["families"].items():

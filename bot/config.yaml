@@ -21,6 +21,38 @@ endpoints:
 fees:
   fee_rate: 0.07   # taker fee = fee_rate * p * (1-p) per share; maker = 0
 
+# Chainlink BTC/USD Data Streams — the ACTUAL resolution source for 5m/15m/4h.
+# All endpoints below are public and unauthenticated: there is no key, no
+# contract and NO SECRET in this file. Chainlink's own Data Streams API is
+# commercially gated and is NOT used; Polymarket rebroadcasts the identical
+# signed report for free (verified bit-exact, 266/266 seconds — audit/A1_chainlink.md).
+# If you ever point this at a credentialled endpoint, put the URL in the env
+# var named by `onchain_check.rpc_url_env` — never in this file.
+oracles:
+  chainlink:
+    rtds_ws: "wss://ws-live-data.polymarket.com"
+    topic: "crypto_prices_chainlink"
+    symbol: "btc/usd"
+    feed_id: "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8"  # mainnet BTC/USD Data Stream
+    max_staleness_secs: 4.0    # p99 publish lag is 2.0s; beyond this latest() returns None and the bot skips
+    max_gap_secs: 5            # strike/settle = first print at-or-after the boundary, searched this far
+    lookback_secs: 30          # how far back price_at_or_before() will forward-fill
+    buffer_secs: 20000         # ~5.5h of 1s prints, > one 4h window
+    ping_interval_secs: 5.0    # RTDS keepalive cadence (documented)
+    recv_timeout_secs: 15.0
+    standby:
+      enabled: true            # GMX republishes the SIGNED Data Streams report (independent operator)
+      url: "https://arbitrum-api.gmxinfra.io/signed_prices/latest"
+      backup_url: "https://arbitrum-api.gmxinfra2.io/signed_prices/latest"
+      idle_poll_secs: 30.0     # while RTDS is healthy this is only an integrity cross-check
+      active_poll_secs: 0.5    # accelerates to real failover cadence when RTDS goes stale
+    onchain_check:
+      enabled: false           # LIVENESS ONLY — 33.8s cadence, never a signal. Off by default.
+      rpc_url: "https://polygon-bor-rpc.publicnode.com"
+      rpc_url_env: "POLYBOT_CHAINLINK_RPC_URL"   # set this to override with a keyed RPC (secret stays in env)
+      feed_address: "0xc907e116054Ad103354f2D350FD2514433D57F6f"
+      poll_secs: 60
+
 families:
   1h:
     enabled: true
@@ -41,11 +73,18 @@ families:
   # (adverse selection: the only cheap "winner" asks left standing are the
   # ones the Chainlink-watching market knows are actually losers). Do NOT
   # re-enable without a real Chainlink oracle wired in oracle.py.
+  # The Chainlink oracle IS now wired (oracle.ChainlinkOracle, B2). The flags
+  # below stay OFF on purpose: wiring the feed and enabling trading are
+  # separate steps. Turn-on procedure + the sigma_1s_floor recalibration that
+  # MUST happen first are documented in audit/B2_impl_chainlink.md.
+  # The engine only constructs/starts the Chainlink oracle when one of these
+  # families has close_snipe or settle_sweep true, so leaving them false keeps
+  # the running 1h bot byte-for-byte unchanged.
   15m:
     enabled: true
     duration_secs: 900
-    oracle: chainlink        # requires a configured Chainlink oracle; else close_snipe stays OFF
-    close_snipe: false       # OFF until a Chainlink oracle is wired (see oracle.py ChainlinkOracle stub)
+    oracle: chainlink        # 15m resolves on the Chainlink BTC/USD Data Stream
+    close_snipe: false       # OFF pending paper validation — see audit/B2_impl_chainlink.md
     settle_sweep: false
   5m:
     enabled: true
