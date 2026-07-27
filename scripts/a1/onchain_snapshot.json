@@ -1,0 +1,33 @@
+{
+  "onchain": {
+    "Polygon": {
+      "rpc": "https://polygon-bor-rpc.publicnode.com",
+      "addr": "0xc907e116054Ad103354f2D350FD2514433D57F6f",
+      "desc": "BTC / USD",
+      "dec": 8,
+      "ver": 6,
+      "inner": "0x014497a2AEF847C7021b17BFF70A68221D22AA63",
+      "roundId": "55340232221132376148",
+      "price": 65277.99,
+      "updatedAt": 1785149953,
+      "age_s": 3.2894175052642822,
+      "rtt_s": 1.7396161556243896,
+      "block": 90963306
+    },
+    "Ethereum": {
+      "rpc": "https://ethereum-rpc.publicnode.com",
+      "addr": "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c",
+      "desc": "BTC / USD",
+      "dec": 8,
+      "ver": 6,
+      "inner": "0x4a3411ac2948B33c69666B35cc6d055B27Ea84f1",
+      "roundId": "129127208515966884148",
+      "price": 65193.67465659,
+      "updatedAt": 1785146483,
+      "age_s": 3475.452111721039,
+      "rtt_s": 1.5808253288269043,
+      "block": 25623699
+    }
+  },
+  "binance": 65333.34
+}
