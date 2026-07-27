@@ -534,14 +534,27 @@ class ChainlinkOracle:
                                        received_at=received_at) else 0
 
     def _subscribe_frame(self) -> str:
+        """Build the RTDS subscribe frame.
+
+        The `filters` value is COMPACT JSON (no space after the colon) and that
+        is load-bearing, not style: the server matches the filter string
+        literally. Verified live 2026-07-27 on back-to-back connections —
+
+            filters='{"symbol": "btc/usd"}'  -> snapshot delivered, 0 updates
+            filters='{"symbol":"btc/usd"}'   -> snapshot delivered, 23 updates/25s
+
+        `json.dumps` inserts that space by default, so a subscription built the
+        obvious way silently degrades to a snapshot-only connection that then
+        idles out. Keep `separators=(",", ":")`.
+        """
         return json.dumps({
             "action": "subscribe",
             "subscriptions": [{
                 "topic": self.topic,
                 "type": "update",
-                "filters": json.dumps({"symbol": self.symbol}),
+                "filters": json.dumps({"symbol": self.symbol}, separators=(",", ":")),
             }],
-        })
+        }, separators=(",", ":"))
 
     def _ws_loop(self) -> None:
         backoff = 1.0

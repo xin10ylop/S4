@@ -97,10 +97,14 @@ def evaluate_close_snipe(
     cfg: dict,
     fee_rate: float,
 ) -> Optional[SnipeSignal]:
-    """One decision-time check. Intended to be called once per second during
-    the last `snipe_last_secs` seconds before close. Returns the first side
-    that clears edge_min (ask below fair by more than edge_min after fees),
-    or None. Caller enforces "one entry per window".
+    """One decision-time check. Intended to be called once per second while
+    `tau` is inside the band returned by `snipe_tau_bounds` (default
+    [2.0s, 5.0s]). Returns the first side that clears edge_min (ask below fair
+    by more than edge_min after fees), or None.
+
+    This function is deliberately a pure per-tick predicate: the window gate
+    and the "one entry per window" rule both live in engine._maybe_snipe, so
+    the timing policy has exactly one home.
     """
     if S_t is None or S_open is None or sigma_1s is None:
         return None
@@ -188,13 +192,34 @@ def resolve_winner_short_binance_proxy(
     return WinnerDetermination(winner, S_open, S_close, "binance_proxy_guarded")
 
 
+def resolve_winner_short_chainlink(market: Market, chainlink) -> WinnerDetermination:
+    """Short families resolved on their ACTUAL source: the Chainlink BTC/USD
+    Data Streams report. `chainlink.winner()` compares the two 18-decimal
+    integers, so there is no distance guard and no basis risk — this
+    reproduced Polymarket's on-chain `result_id` on 35,982/35,982 resolved
+    markets (audit/A1_chainlink.md §2b).
+
+    Returns winner=None when we do not hold both boundary prints. The caller
+    MUST skip in that case; we deliberately do NOT fall back to the Binance
+    proxy, because the windows where Chainlink data is missing are not
+    randomly chosen and the Binance fallback is exactly what produced the
+    3-for-3 adversely-selected settle_sweep losses on 2026-07-15.
+    """
+    winner = chainlink.winner(market.window_start_ts, market.close_ts)
+    s_open = chainlink.strike(market.window_start_ts)
+    s_close = chainlink.settle(market.close_ts)
+    if winner is None:
+        return WinnerDetermination(None, s_open, s_close, "chainlink_boundary_unavailable")
+    return WinnerDetermination(winner, s_open, s_close, "chainlink_data_streams")
+
+
 def resolve_winner(
     market: Market, binance: BinanceOracle, distance_guard_usd: float, chainlink=None
 ) -> WinnerDetermination:
     if market.family == "1h":
         return resolve_winner_1h(market, binance)
     if chainlink is not None:
-        raise NotImplementedError("Chainlink path not wired; see oracle.ChainlinkOracle docstring")
+        return resolve_winner_short_chainlink(market, chainlink)
     return resolve_winner_short_binance_proxy(market, binance, distance_guard_usd)
 
 

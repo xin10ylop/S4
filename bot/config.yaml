@@ -40,6 +40,10 @@ oracles:
     buffer_secs: 20000         # ~5.5h of 1s prints, > one 4h window
     ping_interval_secs: 5.0    # RTDS keepalive cadence (documented)
     recv_timeout_secs: 15.0
+    # A1 §2e measured Chainlink-anchor + Binance-drift-over-the-publish-lag at
+    # 97.12% vs 96.75% sign accuracy at k=1s on 5m. OFF for the first paper run
+    # so the pure Chainlink signal is validated on its own first.
+    hybrid_binance_drift: false
     standby:
       enabled: true            # GMX republishes the SIGNED Data Streams report (independent operator)
       url: "https://arbitrum-api.gmxinfra.io/signed_prices/latest"

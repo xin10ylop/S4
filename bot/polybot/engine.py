@@ -22,7 +22,7 @@ from .execution import ExecutionRouter
 from .fill_engine import FillAttempt
 from .ledger import Ledger
 from .logging_setup import get_logger
-from .oracle import BinanceOracle
+from .oracle import BinanceOracle, ChainlinkOracle
 from .polymarket import ClobClientREST, GammaClient, Market, discover_markets
 from .status_server import StatusState, make_server, write_status_loop
 from .strategy import (evaluate_close_snipe, resolve_winner, settle_sweep_target,
@@ -37,6 +37,19 @@ class Engine:
         self.gamma = GammaClient(config)
         self.clob = ClobClientREST(config)
         self.binance = BinanceOracle(config)
+        # The Chainlink oracle is only constructed when a family that resolves
+        # on it actually has a strategy enabled. With the shipped config
+        # (5m/15m/4h all off) this stays None and the running 1h bot behaves
+        # exactly as before — wiring the feed and enabling trading are
+        # deliberately separate steps. See audit/B2_impl_chainlink.md.
+        self._chainlink_raw_cfg = config.chainlink_cfg
+        self.chainlink: Optional[ChainlinkOracle] = None
+        if self._chainlink_needed():
+            try:
+                self.chainlink = ChainlinkOracle(config)
+            except Exception:  # noqa: BLE001
+                log.exception("failed to construct ChainlinkOracle; chainlink families "
+                              "will skip every tick")
         self.ledger = Ledger(config)
         self.status = StatusState(config, self.ledger)
         self.router = ExecutionRouter(config, self.clob)
@@ -60,6 +73,15 @@ class Engine:
         self._stop = threading.Event()
         self._threads: list = []
         self._http_server = None
+
+    def _chainlink_needed(self) -> bool:
+        """True iff some enabled family declares `oracle: chainlink` AND has a
+        strategy switched on for it."""
+        for fam in self.config.families().values():
+            if (fam.enabled and fam.oracle == "chainlink"
+                    and (fam.close_snipe or fam.settle_sweep)):
+                return True
+        return False
 
     # ------------------------------------------------------------------ setup
     def start(self) -> None:
@@ -95,6 +117,14 @@ class Engine:
         oracle_thread.start()
         self._threads.append(oracle_thread)
 
+        if self.chainlink is not None:
+            # Push-based (websocket); start() spawns its own ingest threads.
+            self.chainlink.start()
+            log.info("chainlink oracle enabled for families: %s",
+                     [f.name for f in self.config.families().values()
+                      if f.oracle == "chainlink" and f.enabled
+                      and (f.close_snipe or f.settle_sweep)])
+
         discovery_thread = threading.Thread(target=self._discovery_loop, daemon=True,
                                              name="discovery")
         discovery_thread.start()
@@ -123,10 +153,19 @@ class Engine:
 
     # --------------------------------------------------------------- oracle
     def _oracle_loop(self) -> None:
+        last_cl_log = 0.0
         while not self._stop.is_set():
             pt = self.binance.poll_once()
             if pt:
                 self.status.set_oracle(pt.price, pt.ts)
+            if self.chainlink is not None and time.time() - last_cl_log >= 60.0:
+                last_cl_log = time.time()
+                h = self.chainlink.health()
+                log.info("chainlink health: %s", h)
+                if not h["healthy"]:
+                    self.status.add_event("oracle_stale",
+                                          f"chainlink staleness={h['staleness_secs']}s "
+                                          f"reconnects={h['n_reconnects']}")
             self._stop.wait(1.0)
 
     # ------------------------------------------------------------ discovery
@@ -200,6 +239,68 @@ class Engine:
                 self._maybe_settle(market, now)
         self._check_resolutions(now)
 
+    # ------------------------------------------------- oracle input selection
+    def _snipe_inputs(self, market: Market, now: float, cfg: dict):
+        """(S_open, S_t, sigma_1s) for this family's oracle, or None to skip.
+
+        Each family reads from the oracle that actually resolves it: 1h from
+        the Binance 1H candle, 5m/15m/4h from the Chainlink BTC/USD Data
+        Stream. Returning None means "no trustworthy inputs this tick" and the
+        caller skips — we never substitute one feed for the other, because
+        Binance disagrees with Chainlink on the 5m resolution sign 4.77% of
+        the time (audit/A1_chainlink.md §2d).
+        """
+        if market.family == "1h":
+            S_open = self.window_open_cache.get(market.slug)
+            if S_open is None:
+                open_px, _ = self.binance.hour_open_close(market.window_start_ts)
+                if open_px is None:
+                    return None
+                S_open = open_px
+                self.window_open_cache[market.slug] = S_open
+            latest = self.binance.latest()
+            if latest is None or (now - latest.ts) > 5:
+                return None  # oracle stale, skip this tick rather than trade on old data
+            sigma_1s = self.binance.rolling_log_return_std(float(cfg["vol_window_secs"]))
+            if sigma_1s != sigma_1s or sigma_1s <= 0:  # NaN check
+                return None
+            return S_open, latest.price, sigma_1s
+
+        # ---- Chainlink families (5m / 15m / 4h) ----------------------------
+        if self.chainlink is None:
+            # Defensive: config should not enable close_snipe for a chainlink
+            # family without the oracle, but never guess a price if it does.
+            log.warning("close_snipe enabled for %s but no chainlink oracle is running",
+                        market.family)
+            return None
+
+        # The strike is the FIRST print at-or-after the window open — exact,
+        # and fixed for the life of the window, so cache it once resolved.
+        S_open = self.window_open_cache.get(market.slug)
+        if S_open is None:
+            S_open = self.chainlink.strike(market.window_start_ts)
+            if S_open is None:
+                return None
+            self.window_open_cache[market.slug] = S_open
+
+        latest = self.chainlink.latest()   # None when staler than max_staleness_secs
+        if latest is None or (now - latest.ts) > 5:
+            return None
+        S_t = latest.price
+        if bool(self._chainlink_raw_cfg.get("hybrid_binance_drift", False)):
+            # A1 §2e: Chainlink anchor + Binance drift across the ~1.4s publish
+            # lag measured 97.12% vs 96.75% sign accuracy at k=1s on 5m. Purely
+            # additive — if Binance is unavailable we fall back to the pure
+            # (lagged) Chainlink print rather than skipping.
+            b_now = self.binance.latest()
+            b_then = self.binance.price_at_or_before(latest.ts)
+            if b_now is not None and b_then is not None:
+                S_t = latest.price + (b_now.price - b_then)
+        sigma_1s = self.chainlink.rolling_log_return_std(float(cfg["vol_window_secs"]))
+        if sigma_1s != sigma_1s or sigma_1s <= 0:  # NaN check
+            return None
+        return S_open, S_t, sigma_1s
+
     # --------------------------------------------------------- close_snipe
     def _maybe_snipe(self, market: Market, now: float) -> None:
         cfg = self.config.snipe_cfg
@@ -211,27 +312,11 @@ class Engine:
             return
         if market.slug in self.snipe_done:
             return
-        if market.family != "1h":
-            # Non-1h close_snipe requires a Chainlink oracle, which is not
-            # wired (see oracle.ChainlinkOracle). Config keeps close_snipe
-            # off for those families by default; this is a defensive guard.
-            return
 
-        S_open = self.window_open_cache.get(market.slug)
-        if S_open is None:
-            open_px, _ = self.binance.hour_open_close(market.window_start_ts)
-            if open_px is None:
-                return
-            S_open = open_px
-            self.window_open_cache[market.slug] = S_open
-
-        latest = self.binance.latest()
-        if latest is None or (now - latest.ts) > 5:
-            return  # oracle stale, skip this tick rather than trade on old data
-        S_t = latest.price
-        sigma_1s = self.binance.rolling_log_return_std(float(cfg["vol_window_secs"]))
-        if sigma_1s != sigma_1s or sigma_1s <= 0:  # NaN check
+        inputs = self._snipe_inputs(market, now, cfg)
+        if inputs is None:
             return
+        S_open, S_t, sigma_1s = inputs
 
         book_up = self.clob.get_book(market.up_token_id)
         book_down = self.clob.get_book(market.down_token_id)
@@ -301,7 +386,8 @@ class Engine:
         wd = self.settle_winner_cache.get(market.slug)
         if wd is None:
             distance_guard = float(cfg["distance_guard_usd"])
-            wd = resolve_winner(market, self.binance, distance_guard)
+            wd = resolve_winner(market, self.binance, distance_guard,
+                                chainlink=self.chainlink)
             log.info("settle winner determination %s: %s (%s) open=%s close=%s",
                       market.slug, wd.winner, wd.reason, wd.s_open, wd.s_close)
             # Only cache a definitive winner or a PERMANENT ambiguity (the
@@ -411,7 +497,7 @@ class Engine:
 
         distance_guard = float(self.config.settle_cfg["distance_guard_usd"])
         wd = self.settle_winner_cache.get(market.slug) or resolve_winner(
-            market, self.binance, distance_guard)
+            market, self.binance, distance_guard, chainlink=self.chainlink)
 
         if gamma_closed and gamma_winner is not None:
             self.ledger.resolve_market(market.slug, market.family, market.close_ts, wd,

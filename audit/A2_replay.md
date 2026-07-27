@@ -136,6 +136,15 @@ written.** It would have taken this period from 8 fills to ~1.
 
 *Caveat: 6–9 signals per tau bucket, one 9-day sample, one trade at 69% of PnL.*
 
+> **CONFIRMED and refined by `audit/A4_change_spec.md` (2026-07-27, 1,738 OOS closes).** A4
+> independently reproduces this rejection of "last 2–3s" / "last qualifying second", including on
+> *this file's own* tau-scan CSV. Two additions:
+> - **`[2, 5]` is a different rule and beats `[1, 6]` on A2's own data: $73.38 vs $59.09** (+24%).
+>   A2 tested where to *move* the firing point; A4 tested where to *bound the band*.
+> - **A2's implied "keep `tau = 6`" holds only at the $25 clip.** At `per_event_cap_usd: 250`
+>   every losing trade in `(0, 6]` comes from `tau >= 5` — worst single trade −$258.75, worst
+>   10-trade run −$232 — versus −$45.26 / −$16 under `[2, 5]`. The shipped config is `[2.0, 5.0]`.
+
 ## 5. What actually caps frequency: the price band, not `edge_min`
 
 At tau=3, across all 222 closes and both outcomes:

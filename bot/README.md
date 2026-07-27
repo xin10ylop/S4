@@ -8,24 +8,45 @@ their live-executability actually looks like.
 
 ## Strategies
 
-- **close_snipe** (primary; default ON for the `1h` family only): in the last
-  `snipe_last_secs` (default 6) before a window closes, compares the live
-  Binance underlying price to a normal-CDF fair value and takes a mispriced
-  ask if the edge clears `edge_min` after fees. 1h uses Binance directly
+- **close_snipe** (primary; default ON for the `1h` family only): in a bounded
+  band before a window closes — `tau in [tau_lo, snipe_last_secs]`, default
+  **[2.0s, 5.0s]**, where
+  `tau_lo = max(snipe_min_tau_secs, latency_ms/1000 + snipe_fill_margin_secs)`
+  — compares the live Binance underlying price to a normal-CDF fair value and
+  takes a mispriced ask if the edge clears `edge_min` after fees. The band is
+  bounded at **both** ends (`audit/A4_change_spec.md`): below `tau_lo` the
+  order arrives at/after the close and cannot fill (measured 0 fills in 46
+  attempts at `tau=1`, 42 of them on an empty book — in LIVE that is a real
+  FAK order into a closed market); above `snipe_last_secs` the `fair` frozen
+  at signal time carries too much unresolved BTC risk for the raised
+  `per_event_cap_usd` (every large loss at a $250 clip came from `tau >= 5`).
+  1h uses Binance directly
   (Binance *is* the market's resolution source, so there's no basis risk).
   5m/15m/4h resolve on Chainlink and stay OFF until a Chainlink oracle is
   wired (see `polybot/oracle.py::ChainlinkOracle` — a documented, honest
   stub, not a silent Binance substitute).
-- **settle_sweep** (measurement mode; default ON for all families): after a
+  > **Operator note — coverage arithmetic.** Audits that counted `snipe eval`
+  > log lines used to divide by 6 (one eval tick per second in the old `(0, 6]`
+  > window) to get "closes evaluated". With the `[2.0, 5.0]` band at a 1 Hz
+  > tick the divisor is now **3–4**. A ~45% drop in eval lines after this
+  > change is the expected, intended effect — **not** a throttle.
+
+- **settle_sweep** (measurement mode; **OFF for every family**): after a
   window closes, sweeps the known winner's cheap asks while the market
   microstructure catches up. Per the executability audit this is largely an
   HFT race in practice (winner-side asks are cheap and present only a small
-  fraction of the time, for well under a second) — this build runs it to
-  *measure* real paper-fill capture rate, not because real money should
-  follow it yet.
+  fraction of the time, for well under a second). The measurement is now in:
+  10 days live on 1h produced **1,235 signals and 0 fills** (every attempt
+  `empty_book` — the post-close book is bulk-cancelled and does not
+  repopulate), so it is disabled for 1h as well as for the Chainlink
+  families. The code path is retained, not deleted: it is the re-entry point
+  if a book that survives the close is ever observed.
 
 Both strategies self-size: they walk the live ask ladder, buying every level
-that still clears the edge threshold, up to `per_event_cap_usd`.
+that still clears the edge threshold, up to a per-event clip —
+`sizing.per_event_cap_usd` (default **$250**, PAPER) for close_snipe and
+`strategy.settle_sweep.cap_usd` (default $25) for settle_sweep, which is kept
+separate so a re-enabled settle_sweep cannot inherit the close_snipe clip.
 
 ## Paper fill engine — the honesty guarantee
 
@@ -138,9 +159,15 @@ it ever touches real money:
    it lists exactly what's confirmed vs. still unverified (notably: the
    `post_order` response schema, and the `fee_rate_bps` semantics).
 2. Test with a tiny `per_event_cap_usd` first, watching `/status` and the
-   log closely.
+   log closely. **The shipped `per_event_cap_usd: 250` is a PAPER setting**
+   chosen to collect tail evidence that the top-of-book backtest cannot
+   provide; `docs/06_live_audit.md` §8 puts the live go/no-go at ~20 resolved
+   trades and a $25–50 starting clip. Turn it down before arming LIVE.
 3. Only then scale `per_event_cap_usd` / `max_open_notional` up, and only
-   after paper-mode fill/resolution data supports it.
+   after paper-mode fill/resolution data supports it. Note that
+   `max_open_notional` is a *stop-opening-new-positions* gate checked before
+   the new fill is sized, so the true ceiling is
+   `max_open_notional + per_event_cap_usd` ($1,250 at the shipped values).
 
 Nothing in this repo will place a real order unless you deliberately set all
 three guards above. If you want to double check: `python -m polybot.main run`
