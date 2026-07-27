@@ -440,7 +440,49 @@ All under `data/multicoin/` (nothing written to `data/fresh5m/`, which another w
    numbers as corroboration, not as the primary estimate.
 
 ### Operational notes
+9b. **Do not re-derive candle anchors from 1s klines without a `volume > 0` filter** (§2.3).
+    The live bot is safe (it reads Binance's own `/klines?interval=1h`, verified at
+    `oracle.py:155` `hour_open_close` and `oracle.py:115` `klines_1h`); the risk is confined to
+    offline analysis. Note `oracle.py:129` `price_at_second` takes the 1s kline *open*, which on
+    a silent second is the carried-forward price — acceptable for `S_t`, but it must never be
+    used to reconstruct a settle.
+
 10. **gamma pagination hard-caps at offset+limit < 3000** (HTTP 422 beyond). Any sweep that
     assumes `limit=1000` works will silently truncate. Resolved markets additionally require
     `closed=true`, or a slug lookup returns an empty list rather than the market.
 11. **Telonex `to_date` is exclusive** (confirmed, unchanged).
+
+---
+
+## 7. Concrete change spec for M2/M3
+
+Ordered by dependency. Nothing here is optional if a second coin is to trade.
+
+1. **Switch the book fetch to the batch endpoint.** Add
+   `ClobClient.get_books(token_ids) -> dict[token_id, OrderBook]` over `POST /books`
+   (body `[{"token_id": ...}, ...]`; responses carry `asset_id`, `timestamp`, `hash`,
+   `tick_size`, `min_order_size`). Rewrite `engine.py:337-338` and the re-fetch inside
+   `fill_engine.py:171` to fetch every live market's books in **one** call per tick.
+   Measured: 344 ms for 14 tokens vs 5,492 ms sequential (§6.3).
+2. **Add `coin` to `Market`.** Generalise `_HOURLY_RE` (`polymarket.py:21`) to
+   `^(bitcoin|ethereum|solana|xrp|dogecoin|bnb|hype)-up-or-down-[a-z]+-\d{1,2}-\d{4}-\d{1,2}(am|pm)-et$`
+   and capture group 1 into `Market.coin`. Make `_hourly_slug(coin, et_dt)` take the coin.
+3. **One oracle per symbol.** Replace `engine.self.binance` with
+   `dict[coin -> BinanceOracle]` built from an explicit `coin -> (symbol, venue)` map.
+   `_snipe_inputs` (`engine.py:254`) must look up by `market.coin` and **return `None` if the
+   coin has no oracle** — fail closed. Without this a new coin is priced off BTC's underlying
+   with no error raised.
+4. **Add a coin allowlist** — `strategy.close_snipe.allowed_coins`, defaulting to
+   `["bitcoin"]` — enforced next to the existing `allowed_families` check at `engine.py:314`,
+   with the same "refuse and warn" behaviour. Widening the regex in step 2 must not by itself
+   widen what trades.
+5. **Read tick size per market from the CLOB book**, not from gamma and not from a constant
+   (§2.2); round limit prices to that tick.
+6. **Per-coin `per_event_cap_usd`.** Calibrate from §3.3 capacity, not one flat $250.
+7. **Only then**: a futures `BinanceOracle` variant for HYPE (different base URL and
+   `/fapi/v1/klines` path) — and only after `fapi.binance.com` is confirmed reachable from the
+   production server. Given §3.3, HYPE is the lowest-value coin on the list; deferring it costs
+   almost nothing.
+
+**Suggested enablement order:** `ethereum` → `solana`, `xrp` → `dogecoin` → `bnb` (with a
+tighter `edge_min`, per §3.5) → `hype` (probably never).
