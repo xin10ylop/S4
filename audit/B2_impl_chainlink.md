@@ -15,10 +15,14 @@ Everything below is tagged **[VERIFIED]** (I ran it in this session and pasted t
 
 * `ChainlinkOracle` is implemented in `bot/polybot/oracle.py` (replacing the `NotImplementedError`
   stub), wired into `engine.py` / `strategy.py`, and configured in `bot/config.yaml`.
-* **125 tests pass** (75 pre-existing + 50 new, all offline with a mocked transport). **[VERIFIED]**
+* **132 tests pass** (75 pre-existing + 57 new, all offline with a mocked transport). **[VERIFIED]**
+  `cd bot && python3 -m pytest tests/ -q` → `132 passed in 5.08s`.
 * Live smoke test against production works end to end: Chainlink price, Binance price and the live
   Polymarket 5m implied probability side by side, plus a full window followed from strike to settle
   with the winner cross-checked against gamma. Output pasted in §5. **[VERIFIED]**
+  Honesty bound on that last item: the gamma cross-check is **n = 1 window**. It proves the
+  transport, the boundary rule and the integer comparison are wired correctly end to end; it is
+  *not* the 100%-agreement validation that §6 step 2 requires before any family is enabled.
 * **No family was enabled.** `5m` / `15m` / `4h` all still ship `close_snipe: false`,
   `settle_sweep: false`. The engine does not even construct the oracle until one of them is
   switched on, so the running 1h paper bot is behaviourally unchanged. Turn-on procedure in §6.
@@ -37,7 +41,7 @@ Everything below is tagged **[VERIFIED]** (I ran it in this session and pasted t
 | `bot/config.yaml` | `oracles.chainlink` block; family comments updated |
 | `bot/polybot/engine.py` | conditional oracle construction/startup, `_snipe_inputs()` per-family oracle selection, chainlink health logging, `chainlink=` threaded into `resolve_winner` |
 | `bot/polybot/strategy.py` | `resolve_winner_short_chainlink()`; `resolve_winner` no longer raises on the chainlink path |
-| `bot/tests/test_chainlink_oracle.py` | 50 new offline tests |
+| `bot/tests/test_chainlink_oracle.py` | 57 new offline tests (12 classes) |
 | `bot/scripts/smoke_chainlink.py` | the live end-to-end demo (not a test; never run by pytest) |
 
 ### Transport topology
@@ -195,21 +199,115 @@ testing would have found it, because the mock would have accepted whatever frame
 
 `cd bot && python3 scripts/smoke_chainlink.py --secs 30` **[VERIFIED]**
 
-<!--SMOKE-->
+```
+==============================================================================
+LIVE SMOKE TEST — ChainlinkOracle
+  ws       wss://ws-live-data.polymarket.com  topic=crypto_prices_chainlink  symbol=btc/usd
+  feed_id  0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8
+  match mainnet BTC/USD Data Stream: True
+==============================================================================
+first fresh print after 1.25s
+
+streaming for 30s (obs_sec = Chainlink observation second, lag = now - obs_sec)
+  obs_sec=1785168414  price=64,514.954891  lag=1.499s  wei=64514954890887793999872  src=rtds_snapshot
+  obs_sec=1785168416  price=64,520.616093  lag=1.357s  wei=64520616093468080000000  src=rtds
+  obs_sec=1785168417  price=64,525.474109  lag=1.010s  wei=64525474108924580000000  src=rtds
+  obs_sec=1785168418  price=64,530.026012  lag=1.302s  wei=64530026012405435000000  src=rtds
+  obs_sec=1785168419  price=64,537.799385  lag=1.608s  wei=64537799385394480000000  src=rtds
+  obs_sec=1785168424  price=64,541.339563  lag=1.684s  wei=64541339563342610000000  src=rtds
+  obs_sec=1785168435  price=64,533.745869  lag=1.126s  wei=64533745869354112500000  src=rtds
+
+------------------------------------------------------------------------------
+PRICE COMPARISON (same instant)
+------------------------------------------------------------------------------
+  Chainlink BTC/USD (Data Streams, resolution source) : $64,524.455913   obs_sec=1785168443 lag=3.68s
+  Binance   BTC/USDT (spot, NOT the resolution source): $64,602.00
+  basis (Chainlink - Binance)                         : $-77.54   (-12.00 bp)
+
+  GMX signed-report cross-check: obs_sec=1785168445 (feedId asserted == mainnet BTC/USD)  disagreements=0
+  Polygon on-chain aggregator (liveness only)  : $64,535.28400173  answer age 15.6s (33.8s cadence — never a signal)
+
+  RTDS lag over 28 prints: p50=1.482s p90=1.870s
+  health: {'started': True, 'samples_buffered': 88, 'newest_obs_sec': 1785168446, 'staleness_secs': 1.558, 'healthy': True, 'coverage_300s': 0.2933, 'n_rtds': 30, 'n_snapshot': 58, 'n_standby': 1, 'n_disagreements': 0, 'n_rejected_future': 0, 'n_reconnects': 0, 'last_error': None}
+
+------------------------------------------------------------------------------
+LIVE POLYMARKET 5m MARKET
+------------------------------------------------------------------------------
+  slug   btc-updown-5m-1785168300   window 1785168300 -> 1785168600   (tau=150s)
+  UP  bid=0.23 ask=0.24   DOWN bid=0.76 ask=0.77
+  market-implied P(Up) = 0.2350
+
+  >>> THE THREE NUMBERS SIDE BY SIDE, RIGHT NOW <<<
+    Chainlink BTC/USD (resolves this market) : $64,523.373875
+    Binance   BTC/USDT (reference only)      : $64,602.00
+    Polymarket 5m implied P(Up)              : 0.2350   (btc-updown-5m-1785168300)
+
+  waiting 150s for the next 5m window to open, so the strike is captured live rather than read from the connect snapshot...
+
+  NEW WINDOW btc-updown-5m-1785168600
+    strike = first Chainlink print >= 1785168600 : $64,560.280523
+    t-  240s  chainlink=$64,590.54  move=  +30.26  leaning=UP    market P(Up)=0.755
+    t-  150s  chainlink=$64,603.54  move=  +43.26  leaning=UP    market P(Up)=0.865
+    t-   60s  chainlink=$64,551.72  move=   -8.56  leaning=DOWN  market P(Up)=0.365
+    t-   10s  chainlink=$64,536.25  move=  -24.03  leaning=DOWN  market P(Up)=0.015
+
+    SETTLED by our oracle: winner=down
+      strike wei = 64560280522597320000000  (obs_sec 1785168600)
+      settle wei = 64541529403080000000000  (obs_sec 1785168900)
+      settle - strike = -18751119517320000000 wei = $-18.751120
+      gamma outcomePrices (ground truth): not resolved yet
+
+  sigma_1s (chainlink, 120s): 3.041e-05   vs config sigma_1s_floor=8.0e-06 (tuned for Binance — MUST be recalibrated)
+  final health: {'started': True, 'samples_buffered': 517, 'newest_obs_sec': 1785168902, 'staleness_secs': 2.401, 'healthy': True, 'coverage_300s': 0.9533, 'n_rtds': 456, 'n_snapshot': 58, 'n_standby': 4, 'n_disagreements': 0, 'n_rejected_future': 0, 'n_reconnects': 0, 'last_error': None}
+
+OK
+```
+
+Gamma had not resolved 4s after the close, so the script printed `not resolved yet` and I polled it
+separately to close the loop against real ground truth: **[VERIFIED]**
+
+```
+RESOLVED after 138s past close
+  outcomes      = ["Up", "Down"]
+  outcomePrices = ["0", "1"]
+  gamma winner  = down
+  our oracle    = down   ->  MATCH: True
+```
+
+(Worth recording as an operational fact in its own right: **gamma took 138s after the close to flip
+`closed=true`**. Before that it still served the *pre-close* `outcomePrices` of `["0.675","0.325"]`,
+which is a stale trading price and not a resolution. Anything reading gamma for a winner must gate on
+`closed == true` and not on `outcomePrices` alone — `ledger.py` already passes `closed=True`
+explicitly, and the smoke script's one-shot read is the reason this shows as `not resolved yet`
+above rather than a mismatch.)
 
 ### What this demonstrates
 
-1. The oracle connects to production and produces a fresh Chainlink price within ~1.3s of start.
+1. The oracle connects to production and produces a fresh Chainlink price **1.25s** after start.
 2. `full_accuracy_value` is preserved as an exact 18-decimal integer (`wei=...`), so
-   `settle >= strike` can be decided without float rounding.
-3. Measured publish lag matches A1's prediction closely (A1: p50 1.37s from this sandbox; here
-   p50 ≈ 1.0s) and is well inside the 4.0s staleness budget.
-4. The Chainlink−Binance basis is live and material — tens of dollars — which is the whole reason
+   `settle >= strike` is decided on integers — visible in the settle block, where the margin is
+   `-18751119517320000000` wei exactly, not a rounded float.
+3. Measured publish lag **p50 1.482s / p90 1.870s** over 28 prints, against A1's predicted p50 1.37s
+   from this same sandbox. Comfortably inside the 4.0s staleness budget, and the one print that did
+   age to 3.68s (line 21, during a REST round-trip) was still served rather than suppressed —
+   correct, since 3.68 < 4.0.
+4. The Chainlink−Binance basis is live and material: **−$77.54 (−12.00 bp)** at that instant. That
+   is ~4x A1's historical median basis of +$12.15 and of the opposite sign, which is exactly why
    this class exists rather than reusing `BinanceOracle`.
-5. The independent GMX signed-report path agrees (`disagreements=0`), and the on-chain aggregator
-   corroborates the level while visibly lagging, exactly as A1 characterised.
-6. A complete 5m window is followed from strike to settle, and our oracle's winner is checked
-   against gamma's actual resolution.
+5. The independent GMX signed-report path agrees (`n_disagreements=0` across the whole run), and the
+   Polygon aggregator corroborates the level ($64,535.28) while visibly lagging (answer age 15.6s),
+   exactly as A1 characterised.
+6. **`n_rtds=456` vs `n_standby=4`** over the full run — the primary path carried ~99% of the load.
+   This is the counter that would have caught the §4 subscribe-filter bug, and it is healthy.
+7. `coverage_300s=0.9533` measured over a complete window, against A1's ~0.967 expectation.
+8. A complete 5m window was followed live from strike to settle. The strike landed on obs_sec
+   `1785168600` and the settle on `1785168900` — both the exact boundary seconds, so the
+   at-or-after search did not even need its gap tolerance. Our winner (`down`) matched gamma's
+   actual resolution.
+9. The market corroborates the signal path: at t−10s our oracle read the window as $24.03 down and
+   the book was at P(Up)=0.015. The signal and the market agree at the point a snipe would fire —
+   and note the sign flipped between t−150s (+$43) and t−60s (−$8.56), which is the whole reason
+   the strategy trades the last few seconds and not earlier.
 
 ---
 
@@ -220,8 +318,8 @@ Wiring the oracle and enabling trading are separate steps on purpose. Before fli
 **Step 1 — recalibrate `sigma_1s_floor`. This is mandatory, not optional.**
 `strategy.close_snipe.sigma_1s_floor: 8.0e-06` was tuned for Binance 1s klines, which are ~76% flat.
 Chainlink moves nearly every second (only 4.66% of consecutive prints repeat **[FROM A1]**), so its
-1s log-return std is structurally larger — the smoke run above measured ~2.8e-05, roughly 3.5x the
-current floor **[VERIFIED]**. The floor feeds `fair_value_up` directly: leaving a too-low floor in
+1s log-return std is structurally larger — the smoke run above measured **3.041e-05, 3.8x the
+current 8.0e-06 floor** **[VERIFIED]**. The floor feeds `fair_value_up` directly: leaving a too-low floor in
 place inflates `|z|` and manufactures false certainty, which is precisely the failure that cost the
 first live paper trade. Derive the floor from `data/data/processed/daily/crypto_prices/` (97 days
 are on disk) and set it per-oracle, not globally.
@@ -272,11 +370,19 @@ fault.
 
 **VERIFIED (executed in this session):** the RTDS subscribe-filter whitespace bug and its exact
 before/after update counts; live RTDS connection, message shapes (empty frame, connect snapshot,
-update), 18-decimal integer fidelity and measured publish lag; GMX `signed_prices/latest`
-reachability, blob decode and `feedId` match against the mainnet BTC/USD stream; Polygon
-`latestRoundData()` read and answer age; live gamma 5m market discovery, book quotes and implied
-probability; full-window strike→settle→winner follow with gamma cross-check; 125/125 tests passing;
-the shipped config leaving every chainlink family off and the engine not constructing the oracle.
+update), 18-decimal integer fidelity and measured publish lag (p50 1.482s / p90 1.870s); GMX
+`signed_prices/latest` reachability, blob decode and `feedId` match against the mainnet BTC/USD
+stream; Polygon `latestRoundData()` read and answer age; live gamma 5m market discovery, book quotes
+and implied probability; full-window strike→settle→winner follow with the gamma cross-check
+resolving `down` = our oracle's `down`; gamma's 138s post-close resolution lag and its stale
+pre-close `outcomePrices`; `n_rtds=456` vs `n_standby=4` and `coverage_300s=0.9533` over a complete
+window; the live −$77.54 Chainlink−Binance basis; `sigma_1s = 3.041e-05` vs the 8.0e-06 config
+floor; **132/132 tests passing** (75 pre-existing + 57 new); and — re-derived directly rather than
+taken from the tests — the shipped config leaving all three chainlink families
+`close_snipe: false` / `settle_sweep: false`, `_chainlink_needed()` evaluating False so the engine
+never constructs the oracle, `latest()` flipping to `None` between 3.9s and 4.1s of age, an empty
+oracle returning `None`/`inf`, a future-stamped print being rejected, and `config.yaml` containing
+no credential-shaped strings.
 
 **FROM A1 (not re-derived here):** the 35,982/35,982 `result_id` agreement; the 266/266 bit-exact
 RTDS-vs-signed-report match; Binance's 4.77% 5m error rate; the bfill-vs-ffill 99.59%/98.03%
