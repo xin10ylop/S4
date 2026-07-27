@@ -34,6 +34,11 @@ class StatusState:
         self.last_discovery_ts: Optional[float] = None
         self.last_oracle_price: Optional[float] = None
         self.last_oracle_ts: Optional[float] = None
+        # M4 risk guards. Set by the engine each tick; None until it has run
+        # once, which is itself information ("the engine has not ticked yet").
+        self._warmup: Optional[dict] = None
+        self._risk: Optional[dict] = None
+        self._depth: Optional[dict] = None
 
     def set_tracked_markets(self, markets: Dict[str, dict]) -> None:
         with self._lock:
@@ -47,6 +52,15 @@ class StatusState:
         with self._lock:
             self.last_oracle_price = price
             self.last_oracle_ts = ts
+
+    def set_guards(self, warmup: Optional[dict], risk: Optional[dict],
+                    depth: Optional[dict]) -> None:
+        """Publish the M4 guard state (warmup / circuit breaker / depth
+        reference) for status.json and the status CLI."""
+        with self._lock:
+            self._warmup = warmup
+            self._risk = risk
+            self._depth = depth
 
     def add_event(self, kind: str, message: str, **extra: Any) -> None:
         with self._lock:
@@ -64,6 +78,9 @@ class StatusState:
             events = list(self._events)
             last_oracle_price = self.last_oracle_price
             last_oracle_ts = self.last_oracle_ts
+            warmup = dict(self._warmup) if self._warmup else None
+            risk = dict(self._risk) if self._risk else None
+            depth = dict(self._depth) if self._depth else None
         now = time.time()
         metrics = self.ledger.metrics()
         pnl_today = self.ledger.pnl_today()
@@ -87,6 +104,18 @@ class StatusState:
                 "fees_paid": metrics["fees_paid"],
             },
             "metrics": metrics,
+            # M4 guards. `trading_blocked` is the single field an operator (or
+            # an alerting rule) should look at: True means the bot is alive and
+            # deliberately not opening positions.
+            "guards": {
+                "warmup": warmup,
+                "risk": risk,
+                "depth_reference": depth,
+                "trading_blocked": bool(
+                    (warmup is not None and not warmup.get("ready", True))
+                    or (risk is not None and risk.get("tripped", False))
+                ),
+            },
             "recent_events": list(reversed(events))[:50],
         }
 

@@ -46,10 +46,11 @@ class StubBinance:
     fair_up saturates at fair_cap and a 0.50 ask is a clear mispricing."""
 
     def __init__(self, now: float, s_t: float = 101_000.0, s_open: float = 100_000.0,
-                 staleness: float = 0.0, sigma: float = 1e-4):
+                 staleness: float = 0.0, sigma: float = 1e-4, n_samples: int = 120):
         self._pt = PricePoint(ts=now - staleness, price=s_t)
         self._s_open = s_open
         self._sigma = sigma
+        self._n = n_samples
 
     def hour_open_close(self, window_start_ts):
         return self._s_open, None
@@ -59,6 +60,11 @@ class StubBinance:
 
     def rolling_log_return_std(self, window_secs):
         return self._sigma
+
+    def n_samples(self, window_secs=120.0):
+        # M4 guard 2 reads this; the default here is a fully warm buffer so the
+        # pre-existing gating tests keep testing what they were written to test.
+        return self._n
 
 
 class StubClob:
@@ -80,6 +86,8 @@ class StubLedger:
         self.snipe_signals: List[object] = []
         self.settle_signals: List[tuple] = []
         self.open_notional = 0.0
+        self.today_pnl = 0.0
+        self.streak = 0
 
     def record_snipe_signal(self, sig):
         self.snipe_signals.append(sig)
@@ -100,6 +108,27 @@ class StubLedger:
 
     def all_open_positions(self):
         return []
+
+    # --- M4 guard 3 (circuit breaker) inputs -------------------------------
+    def __init_risk__(self):
+        pass
+
+    def pnl_today(self):
+        return {"n": 0, "gross_pnl": 0.0, "fees_paid": 0.0, "net_pnl": self.today_pnl}
+
+    def consecutive_losses(self, since_ts=None, limit=200):
+        return self.streak
+
+    def n_resolved_trades(self):
+        return 0
+
+    def recent_trade_pnls(self, limit=50, since_ts=None):
+        return []
+
+    def metrics(self):
+        return {"n_resolved_positions": 0, "n_fill_attempts": 0, "attempts_by_outcome": {},
+                "n_filled": 0, "win_rate": None, "gross_pnl": 0.0, "fees_paid": 0.0,
+                "net_pnl": 0.0, "resolution_disagreements": 0, "per_strategy_family": {}}
 
 
 @dataclass
@@ -130,8 +159,20 @@ def _make_engine(tmpdir: str, **raw_overrides) -> Engine:
         raw[k] = v
     eng = Engine(Config(raw=raw, path=CONFIG_YAML))
     eng.ledger = StubLedger()
+    eng.breaker.ledger = eng.ledger      # breaker reads the stub, not the temp sqlite
     eng.executor = StubExecutor()
     return eng
+
+
+def warm(engine, now: float) -> None:
+    """Satisfy M4 guard 2 (warmup) so a test can exercise something else.
+
+    Tests run on a synthetic clock (`now = 1_000_000.0`), so the real
+    `started_at` set in Engine.__init__ would read as negative uptime. Every
+    test that expects a fill must call this — which is the point: the guard is
+    on by default and cannot be bypassed by accident.
+    """
+    engine.warmup.started_at = now - 10_000.0
 
 
 class _EngineTestBase(unittest.TestCase):
@@ -142,6 +183,7 @@ class _EngineTestBase(unittest.TestCase):
         self.engine = _make_engine(self._tmp.name)
         self.engine.binance = StubBinance(self.now)
         self.engine.clob = StubClob()
+        warm(self.engine, self.now)
 
     def _market_at_tau(self, tau: float, slug: str = "m1") -> FakeMarket:
         return FakeMarket(slug=slug, close_ts=self.now + tau)
@@ -213,6 +255,7 @@ class TestSnipeWindowGate(_EngineTestBase):
         eng.config.raw["execution"]["latency_ms"] = 3000  # floor -> 3.5s
         eng.binance = StubBinance(self.now)
         eng.clob = StubClob()
+        warm(eng, self.now)
         eng._maybe_snipe(FakeMarket(slug="a", close_ts=self.now + 3.0), self.now)
         self.assertEqual(eng.executor.submissions, [])
         eng._maybe_snipe(FakeMarket(slug="b", close_ts=self.now + 4.0), self.now)
@@ -258,6 +301,7 @@ class TestSizingAndSettleWiring(_EngineTestBase):
         eng = _make_engine(self._tmp.name)
         eng.binance = StubBinance(self.now)
         eng.clob = StubClob()
+        warm(eng, self.now)
         eng.config.raw["families"]["1h"]["settle_sweep"] = True
         eng.settle_winner_cache["s1"] = type("W", (), {"winner": "up", "reason": "t",
                                                        "s_open": 1.0, "s_close": 2.0})()

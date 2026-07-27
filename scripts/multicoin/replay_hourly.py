@@ -109,6 +109,9 @@ class HParams:
     tau_from_print: bool = True             # charge print staleness into tau
     # --- conventions --------------------------------------------------------
     sigma_min_periods: int = 30
+    # --- CANDIDATE GUARDS (not shipped; quantified on TRAIN only) ----------
+    z_min: float = 0.0                      # skip ticks the model is unsure about
+    z_max: float = INF                      # skip the over-confident regime
     winner_source: str = "result_id"        # "result_id" | "binance"
     tick_hz: float = 1.0
     tau_grid: Optional[Sequence[float]] = None
@@ -319,6 +322,12 @@ def run_window(w: HWindow, feed: BinanceFeed, p: HParams) -> Optional[dict]:
         tau_eff = ((close_s * 1e6) - obs_us) / 1e6 if p.tau_from_print else tau_nom
         if tau_eff <= 0:
             continue
+
+        if p.z_min > 0.0 or math.isfinite(p.z_max):
+            zz = abs(math.log(S_t / S_open)) / (max(sigma, p.sigma_1s_floor)
+                                                * math.sqrt(tau_eff))
+            if zz < p.z_min or zz > p.z_max:
+                continue
 
         lv_up, age_up = w.up.at(t_us)
         lv_dn, age_dn = w.dn.at(t_us)

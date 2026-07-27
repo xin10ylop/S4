@@ -82,6 +82,47 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"cumulative: gross=${pnl['cumulative_gross']:.4f}  fees=${pnl['fees_paid']:.4f}  "
           f"net=${pnl['cumulative_net']:.4f}")
 
+    g = data.get("guards") or {}
+    print("\n--- Risk guards (M4) ---")
+    if not g:
+        print("  (no guard state in status.json — bot predates M4 or has not ticked yet)")
+    else:
+        banner = "!! TRADING BLOCKED !!" if g.get("trading_blocked") else "trading allowed"
+        print(f"  {banner}")
+        wu = g.get("warmup") or {}
+        if wu:
+            print(f"  warmup:  ready={wu.get('ready')} ({wu.get('reason')})  "
+                  f"oracle_samples={wu.get('oracle_samples')}/"
+                  f"{wu.get('required_oracle_samples')}  "
+                  f"uptime={wu.get('uptime_secs')}/{wu.get('required_uptime_secs')}s")
+        r = g.get("risk") or {}
+        if r:
+            lim = r.get("daily_loss_limit_usd")
+            print(f"  breaker: tripped={r.get('tripped')}  "
+                  f"daily_realized=${r.get('daily_realized_pnl'):.2f}  "
+                  f"limit={'$%.2f' % lim if lim is not None else 'none'}  "
+                  f"consecutive_losses={r.get('consecutive_losses')}/"
+                  f"{r.get('max_consecutive_losses')}  utc_day={r.get('utc_day')}")
+            for reason in r.get("reasons") or []:
+                print(f"           reason: {reason}")
+            if r.get("override_active"):
+                ov = r.get("override") or {}
+                print(f"           MANUAL OVERRIDE ACTIVE (granted at daily pnl "
+                      f"${ov.get('pnl_at_override', 0.0):.2f}); breaker re-arms if the "
+                      f"day loses another full limit")
+            if r.get("tripped"):
+                print("           resume with: python -m polybot.main resume")
+        d = g.get("depth_reference") or {}
+        if d:
+            print(f"  adverse-size filter: enabled={d.get('enabled')} "
+                  f"mode={d.get('mode')} max_size_ratio={d.get('max_size_ratio')}")
+            for fam, s in (d.get("families") or {}).items():
+                ref = s.get("reference_size")
+                print(f"           {fam}: samples={s.get('samples')}/"
+                      f"{s.get('min_samples')} reference_size="
+                      f"{('%.2f' % ref) if ref is not None else 'not established'}"
+                      f"  (filter {'ACTIVE' if (d.get('enabled') and ref) else 'inert'})")
+
     m = data["metrics"]
     print("\n--- Metrics ---")
     print(f"fill attempts: {m['n_fill_attempts']}  by outcome: {m['attempts_by_outcome']}")
@@ -171,6 +212,59 @@ def cmd_pnl(args: argparse.Namespace) -> int:
     return 0
 
 
+def _breaker(config):
+    from .ledger import Ledger
+    from .risk import CircuitBreaker
+
+    ledger = Ledger(config)
+    return CircuitBreaker(config.risk_cfg, ledger, override_path=config.risk_override_path), ledger
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Manual override: release the circuit breaker for the rest of this UTC day."""
+    config = load_config(args.config)
+    setup_logging(config)
+    breaker, ledger = _breaker(config)
+    try:
+        st = breaker.evaluate()
+        if not st.tripped and not args.force:
+            print("Circuit breaker is NOT tripped — nothing to resume.")
+            print(f"  daily realized: ${st.daily_pnl:.2f}   "
+                  f"consecutive losses: {st.consecutive_losses}")
+            print("  (use --force to pre-authorise an override for today anyway)")
+            return 0
+        rec = breaker.write_override()
+        after = breaker.evaluate()
+        print(f"Override written to {config.risk_override_path}")
+        print(f"  utc_day={rec['utc_day']}  pnl_at_override=${rec['pnl_at_override']:.2f}")
+        print(f"  breaker now tripped={after.tripped}")
+        if after.tripped:
+            print("  STILL TRIPPED: " + "; ".join(after.reasons))
+        print("  The override expires at UTC midnight and re-arms if the day loses "
+              "another full limit. A running bot picks it up within one tick.")
+        return 0
+    finally:
+        ledger.close()
+
+
+def cmd_halt(args: argparse.Namespace) -> int:
+    """Cancel a manual override (re-arm the breaker immediately)."""
+    config = load_config(args.config)
+    setup_logging(config)
+    breaker, ledger = _breaker(config)
+    try:
+        removed = breaker.clear_override()
+        print("Override cleared." if removed else "No override file to clear.")
+        st = breaker.evaluate()
+        print(f"  breaker tripped={st.tripped}  daily realized=${st.daily_pnl:.2f}  "
+              f"consecutive losses={st.consecutive_losses}")
+        for reason in st.reasons:
+            print(f"  reason: {reason}")
+        return 0
+    finally:
+        ledger.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m polybot.main")
     p.add_argument("--config", default=None, help="path to config.yaml (default: bot/config.yaml)")
@@ -180,6 +274,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="pretty-print status.json + pnl summary").set_defaults(func=cmd_status)
     sub.add_parser("markets", help="list currently-tracked BTC markets").set_defaults(func=cmd_markets)
     sub.add_parser("pnl", help="per-strategy/per-family PnL + attempts from the ledger DB").set_defaults(func=cmd_pnl)
+    pr = sub.add_parser("resume", help="manually release the daily-loss circuit breaker "
+                                        "for the rest of this UTC day")
+    pr.add_argument("--force", action="store_true",
+                    help="write the override even if the breaker is not currently tripped")
+    pr.set_defaults(func=cmd_resume)
+    sub.add_parser("halt", help="cancel a manual override (re-arm the circuit breaker)"
+                    ).set_defaults(func=cmd_halt)
     return p
 
 

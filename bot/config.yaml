@@ -138,6 +138,81 @@ strategy:
     sigma_1s_floor: 8.0e-06   # vol floor: quiet/stale polling underestimates vol -> false certainty
     fair_cap: 0.98            # model certainty saturates here; a Gaussian on polled 1s data
                               # cannot distinguish 99% from 99.9999% (fat-tail protection)
+
+    # ---------------- M4 GUARD 1: ADVERSE-SIZE FILTER (default OFF) ----------
+    # Caps or skips an ask level whose size is anomalous relative to that
+    # family's own recent typical depth:
+    #     size_ratio = level.size / median(last `history_n` in-band ask sizes)
+    # "in-band" = only levels inside (price_min, price_max) are recorded, which
+    # matters enormously: median best-ask size by price bucket on 275 days of 1h
+    # quotes is 24,190 at (0,0.1] but 10.6 at (0.5,0.7], so a reference pooled
+    # over all prices is dominated by free lottery tickets and is meaningless.
+    #
+    # DEFAULT OFF ON MEASURED EVIDENCE, not on convenience. Replaying shipped
+    # close_snipe over 6,523 1h closes (236 fills, 119 days) found the OPPOSITE
+    # of adverse selection:
+    #   levels > 5x the family median: 44 fills, 44/44 won, +38.1c/share
+    #   normal levels:                189 fills, 175/189 won (92.6%), +22.4c/share
+    #   all 14 losing trades came from NORMAL-sized levels; worst LARGE trade +$14.91
+    #   OLS pnl ~ log10(size_ratio) + price: size coef +0.051 (t=+2.87) — bigger
+    #     is BETTER even after controlling for price; reproduced on an
+    #     independent 359-trade wider sample (coef +0.051, t=+2.58).
+    # Turning it on at 5x would have discarded 69% of realized PnL (skip mode)
+    # or 15% (cap mode) to prevent a loss that never occurred. See
+    # audit/M4_risk_guards.md §1. Re-run that measurement per coin before
+    # enabling for a new family — the mechanism (an informed seller) is real in
+    # principle, it simply is not what a big offer means on the 1h BTC book.
+    adverse_size:
+      enabled: false          # measured: no adverse effect on 1h BTC. Do not flip on vibes.
+      mode: "cap"             # "cap" = take at most the ceiling from that level and keep
+                              # walking; "skip" = take nothing from it and keep walking.
+                              # Neither can re-baseline max_walk_above_best.
+      max_size_ratio: 8.0     # a level is anomalous above this multiple of the reference.
+                              # Measured ratio distribution on the 233 shipped-parameter
+                              # fills that had a reference: p50 0.80x, p75 3.4x, p90 11.9x.
+                              # 8x would have bound on 12.4% of taken levels (29/233).
+      history_n: 200          # rolling window of in-band level observations per family
+      min_samples: 30         # below this the reference is meaningless and the filter is
+                              # INERT (logged in status.json guards.depth_reference).
+                              # Samples come only from books the bot already fetches inside
+                              # the snipe window, so this costs no extra REST traffic — but
+                              # it also means a fresh deployment takes ~3-4 days of closes
+                              # to accumulate 30 in-band observations for one coin.
+
+    # ---------------- M4 GUARD 2: WARMUP AFTER RESTART (default ON) ----------
+    # sigma_1s is the std of 1s log returns over the trailing vol_window_secs.
+    # After a restart (deploy, watchdog, OOM, crash) that buffer is nearly
+    # empty and BinanceOracle.rolling_log_return_std will answer from as few as
+    # TWO returns. A too-small sigma inflates |z| and pushes `fair` toward
+    # fair_cap — the mechanism behind this project's first -$25 loss.
+    #
+    # THRESHOLD DERIVED FROM DATA (19,569 evaluation ticks over 6,523 1h closes,
+    # audit/M4_risk_guards.md §2). Fraction of signals that exist ONLY because
+    # sigma was cold, and what those extra trades earn vs the warm tape
+    # (243 warm trades, 93.4% win, +25.0c/share):
+    #     n=3   +25.5% extra signals   +9.2c/share   (-15.8c vs warm, p<0.001)
+    #     n=45   +6.2% extra signals   -3.8c/share   (-28.8c vs warm, p<0.001)
+    #     n=60   +3.3% extra signals   +1.2c/share   (-23.8c vs warm, p<0.001)
+    #     n=90   +2.5% extra signals  +13.0c/share   (-12.0c vs warm, p=0.002)
+    # Cold-sigma trades are worse at EVERY n; contamination falls monotonically.
+    # The cost of waiting is ~zero: at 0.88 trades/day a 120s lockout forgoes
+    # 0.0012 trades per restart, so the threshold is set by robustness, not by
+    # opportunity cost.
+    warmup:
+      enabled: true
+      min_oracle_samples: 60  # samples inside the trailing vol_window_secs (120s).
+                              # NOT 90/120: the oracle loop polls at
+                              # (1.0s wait + fetch latency), so a slow link yields
+                              # ~85-105 samples per 120s and a 90+ threshold could
+                              # block trading FOREVER — a worse failure than the one
+                              # being guarded. 60 tolerates a 2.0s effective poll
+                              # period and still cuts cold contamination 25.5% -> 3.3%.
+      min_uptime_secs: 120    # one full vol window of wall clock, independent of the
+                              # sample count (a burst of duplicate polls after a network
+                              # stall can satisfy a count but not a clock). Also
+                              # guarantees a discovery pass has completed.
+      log_every_secs: 15      # a bot that is silently refusing to trade is
+                              # indistinguishable from a bot with no signals.
   settle_sweep:
     settle_delay_secs: 2      # wait after close before sweeping (oracle/print publish lag)
     settle_window_secs: 120   # stop sweeping after this many seconds post-close
@@ -163,6 +238,50 @@ sizing:
   # of close via the gamma poll, so real concurrency is ~1; $1000 is ~4 clips of headroom
   # and leaves room for a second family later.
   max_open_notional: 1000
+
+# ---------------- M4 GUARD 3: DAILY LOSS LIMIT / CIRCUIT BREAKER ------------
+# sizing.per_event_cap_usd bounds ONE trade and sizing.max_open_notional bounds
+# SIMULTANEOUS exposure, but nothing bounded a BAD DAY. At a $250 clip an
+# 85%-win strategy can still string losses. This stops the opening of new
+# positions (close_snipe AND settle_sweep) once the day is bad enough, and
+# resets automatically at UTC midnight because the daily figure is computed
+# from UTC midnight — there is no cron and no state to reset by hand.
+#
+# CALIBRATED ON THE MEASURED TAPE (236 fills / 121 trading days at shipped
+# parameters, audit/M4_risk_guards.md §3):
+#   worst single day        -$41.47   days worse than -$50: 0 of 121
+#   days worse than -$25:  2 of 121 (1.7%)
+#   longest losing streak:  3 trades (once); every other streak was 1
+# So $100/day and 4-in-a-row would NEVER have fired on the observed tape: this
+# is a breaker for genuine breakage (wrong feed, wrong side, regime change),
+# not a variance throttle. One max-clip loss (~-$250) trips it immediately,
+# which is intended — that has never happened at these parameters.
+#
+# RE-DERIVE THESE WHEN MORE COINS GO LIVE. They are calibrated for ~2 trades/day
+# on one coin; at ~6 coins the daily loss distribution widens by roughly sqrt(6).
+risk:
+  daily_loss_limit:
+    enabled: true
+    bankroll_usd: 1250        # the bot's true exposure ceiling: max_open_notional ($1000)
+                              # + per_event_cap_usd ($250), because the global cap is
+                              # evaluated BEFORE the new trade is sized.
+    max_daily_loss_pct: 8.0   # -> $100/day. 2.4x the worst day ever observed.
+    max_daily_loss_usd: null  # optional absolute limit; when BOTH are set the TIGHTER
+                              # (smaller) one wins — combining two safety limits the
+                              # unsafe way is how guards get quietly widened.
+  consecutive_loss_brake:
+    enabled: true
+    max_consecutive_losses: 4 # max observed streak was 3, so this never false-trips on
+                              # the measured tape but catches a systematic break (e.g.
+                              # buying the wrong side) after 4 rather than after a day.
+                              # Counted per RESOLVED MARKET, not per fill row, and scoped
+                              # to the current UTC day.
+  log_every_secs: 60          # rate limit for the "breaker tripped" ERROR line
+  # Manual override: `python -m polybot.main resume`. It is deliberately NOT an
+  # off switch — it is scoped to one UTC day AND records the loss level at which
+  # it was granted, so the breaker re-arms if the day loses another full limit
+  # or a new losing streak forms. `python -m polybot.main halt` cancels it.
+  override_path: "bot/data/risk_override.json"
 
 execution:
   latency_ms: 1500            # simulated reaction latency before re-fetching the book to fill against

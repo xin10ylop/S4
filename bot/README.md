@@ -48,6 +48,84 @@ that still clears the edge threshold, up to a per-event clip —
 `strategy.settle_sweep.cap_usd` (default $25) for settle_sweep, which is kept
 separate so a re-enabled settle_sweep cannot inherit the close_snipe clip.
 
+## Risk guards (M4)
+
+Five things bound risk here. Two are old (`per_event_cap_usd` per trade,
+`max_open_notional` across open positions); three were added in M4 and are
+documented with their measurements in `../audit/M4_risk_guards.md`. All are
+config-driven and backward compatible — a `config.yaml` written before M4
+still loads, and the two guards that matter default **ON** even if the file
+says nothing about them.
+
+| Guard | Config | Default | Blocks |
+|---|---|---|---|
+| 1. Adverse-size filter | `strategy.close_snipe.adverse_size` | **OFF** (measured) | caps/skips an ask level whose size is anomalous vs the family's recent typical depth |
+| 2. Warmup after restart | `strategy.close_snipe.warmup` | **ON** | any close_snipe until the vol buffer and process uptime are both warm |
+| 3. Daily loss limit + consecutive-loss brake | `risk:` | **ON** | opening *any* new position after a bad day |
+
+**1. Adverse-size filter — implemented, tested, and OFF by default.** The
+statistic is `level.size / median(recent in-band ask-level sizes for this
+family)`; only levels inside `(price_min, price_max)` feed the reference,
+because a book that has already decided quotes ~24,000 shares at $0.01 and ~11
+shares at $0.50 and pooling them makes the statistic meaningless. The default
+is OFF **because the measurement refuted the hypothesis**: replaying shipped
+close_snipe over 6,523 1h closes, levels larger than 5x the family median went
+44-for-44 at +38.1c/share while normal levels went 175-for-189 (92.6%) at
++22.4c/share — every losing trade came from a *normal*-sized offer. Enabling
+it at 5x would have discarded 69% of realized PnL (skip mode) to prevent a
+loss that never happened. The mechanism it guards (an informed seller) is real
+in principle — it is what poisoned `settle_sweep` 3-for-3 — but there the
+seller knew the Chainlink print and we were reading Binance; in close_snipe
+the information is the public BTC price, so a big resting offer is a stale
+market-maker quote, not a sniper. **Re-run the measurement per coin before
+enabling it for a new family.**
+
+**2. Warmup after restart.** `sigma_1s` is the std of 1s log returns over the
+trailing 120s of oracle polls; a fresh process has an almost empty buffer and
+`rolling_log_return_std` will answer from as few as two returns. A too-small
+sigma inflates `|z|` and pushes `fair` toward `fair_cap` — the mechanism
+behind this project's first −$25 loss. Trading is blocked until
+`min_oracle_samples: 60` samples exist inside the vol window **and**
+`min_uptime_secs: 120` of wall clock have passed, logged every 15s while
+warming. Measured: signals that exist *only* because sigma was cold are
+25.5% of the tape at n=3 and earn +9.2c/share against the warm tape's
++25.0c/share (−15.8c, day-clustered p<0.001); at n=60 that contamination is
+3.3%. The lockout costs ~0.0012 trades per restart.
+
+**3. Daily loss limit / circuit breaker.** Stops opening new positions once
+realized PnL since UTC midnight breaches
+`max_daily_loss_pct` × `bankroll_usd` (or `max_daily_loss_usd`, whichever is
+**tighter**), or once `max_consecutive_losses` resolved trades in a row have
+lost. Resets automatically at UTC midnight (the daily figure is computed from
+UTC midnight — there is no cron and no state to clear). Applies to
+close_snipe *and* settle_sweep. Calibration: over 121 trading days the worst
+day was −$41.47, no day was worse than −$50, and the longest losing streak was
+3 — so the shipped $100/day and 4-in-a-row would never have fired on the
+observed tape. This is a breaker for genuine breakage, not a variance
+throttle.
+
+```bash
+python -m polybot.main status     # shows a "Risk guards (M4)" section
+python -m polybot.main resume     # manual override: release the breaker for this UTC day
+python -m polybot.main halt       # cancel an override (re-arm immediately)
+```
+
+The override is **not** an off switch: it is scoped to one UTC day and records
+the loss level at which it was granted, so the breaker re-arms if the day
+loses another full limit or a new losing streak forms. A forgotten override
+cannot silently disable the guard. `status.json` carries
+`guards.trading_blocked` — that single boolean is what an alerting rule should
+watch, because "alive but deliberately not trading" otherwise looks exactly
+like "alive with no signals".
+
+### Verifying the guards are real
+
+`python3 scripts/m4/mutation_check.py` copies `bot/` to a temp dir, deletes or
+neuters each guard in turn (23 mutations), and requires the suite to go red
+for every one. A previous audit of this project found a guard that could be
+removed entirely with a green suite; this is the standing check that it cannot
+happen again. Current result: **23/23 killed**.
+
 ## Paper fill engine — the honesty guarantee
 
 A signal is never filled against the book that triggered it. The engine
@@ -89,7 +167,11 @@ While `run` is active: `curl localhost:8899/status | python3 -m json.tool` and
 - `bot/data/fills.csv`, `bot/data/pnl.csv` — append-only CSV mirrors.
 - `bot/data/polybot.log` — rotating log file (also mirrored to stdout).
 - `bot/data/status.json` — machine-readable snapshot, rewritten every few
-  seconds (`status.write_interval_secs` in config.yaml).
+  seconds (`status.write_interval_secs` in config.yaml). Includes a `guards`
+  block (warmup / circuit breaker / depth reference) and the single
+  `guards.trading_blocked` boolean.
+- `bot/data/risk_override.json` — written by `python -m polybot.main resume`;
+  UTC-day-scoped, removed by `halt`. Absent = no override.
 
 All of `bot/data/` is git-ignored.
 
@@ -105,14 +187,19 @@ logs them.
 
 ```bash
 cd bot
+python3 -m pytest tests -q          # 212 tests
 python3 -m unittest discover -s tests -v
 ```
 
 These are deterministic, offline unit tests (no network) covering the fee/
 fill-walk math, the fair-value formula, ledger PnL arithmetic, slug parsing
-(including a live-verified gamma quirk, see below), and the paper/live
-execution guards. They complement, not replace, testing against live data —
-see "What was actually tested" below.
+(including a live-verified gamma quirk, see below), the paper/live execution
+guards, and the three M4 risk guards. They complement, not replace, testing
+against live data — see "What was actually tested" below.
+
+Tests that expect a fill must explicitly warm the engine
+(`tests.test_engine_gating.warm`) — the warmup guard is on by default and
+cannot be bypassed by accident, which is why it shows up in unrelated tests.
 
 ## Live-verified quirks worth knowing before you touch this code
 
@@ -228,9 +315,11 @@ bot/
     execution.py               # PAPER/LIVE order router (gated real-order path)
     ledger.py                  # SQLite + CSV persistence, resolution, PnL/metrics
     status_server.py           # status.json writer + stdlib HTTP server (/status, /health)
+    depth.py                   # M4 guard 1: rolling per-family depth reference statistic
+    risk.py                    # M4 guards 2+3: WarmupGate, CircuitBreaker
     engine.py                  # orchestration: discovery/oracle/tick loops, thread pool
     ws_client.py               # optional, off-by-default WS market-data client
-    main.py                    # CLI: run / status / markets
+    main.py                    # CLI: run / status / markets / pnl / resume / halt
   scripts/
     polybot.service            # systemd unit
     deploy_server.sh           # clone/pull, venv, install service, start

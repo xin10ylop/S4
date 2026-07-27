@@ -57,6 +57,23 @@ class Engine:
         self.router = ExecutionRouter(config, self.clob)
         self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fill")
 
+        # ---- M4 risk guards -------------------------------------------------
+        # 1) adverse-size filter: rolling per-family depth reference. The
+        #    tracker is always built (so the statistic is observable in
+        #    status.json even with the filter off); whether it BINDS is decided
+        #    by depth.max_level_shares from strategy.close_snipe.adverse_size.
+        self._adverse_cfg = dict(self.config.adverse_size_cfg)
+        self.depth = DepthTracker(
+            history_n=int(self._adverse_cfg.get("history_n", 200)),
+            min_samples=int(self._adverse_cfg.get("min_samples", 30)),
+        )
+        # 2) warmup after restart: `started_at` is process start, so a deploy /
+        #    watchdog restart resets it — which is exactly the point.
+        self.warmup = WarmupGate(self.config.warmup_cfg)
+        # 3) daily loss limit + consecutive-loss brake
+        self.breaker = CircuitBreaker(self.config.risk_cfg, self.ledger,
+                                       override_path=self.config.risk_override_path)
+
         self.known_markets: Dict[str, Market] = {}   # grows monotonically, used for scheduling/resolution
         self.markets: Dict[str, Market] = {}          # most recent discovery snapshot
 
@@ -72,6 +89,7 @@ class Engine:
         # consecutive empties instead of retrying for the whole window.
         self.settle_empty_streak: Dict[str, int] = {}
         self._snipe_family_warned: Set[str] = set()
+        self._breaker_blocked_slugs: Set[str] = set()
 
         self._stop = threading.Event()
         self._threads: list = []
@@ -99,6 +117,27 @@ class Engine:
             log.warning("close_snipe window is EMPTY (tau_lo=%.2f >= tau_hi=%.2f) — the bot "
                         "will never fire a snipe. Check strategy.close_snipe.snipe_last_secs "
                         "vs execution.latency_ms.", _tl, _th)
+        # M4 guards: announce the configured state once, loudly, at boot. A
+        # guard nobody can see in the log is a guard nobody can verify.
+        log.info("M4 guard 1 adverse_size: enabled=%s mode=%s max_size_ratio=%s "
+                 "history_n=%s min_samples=%s",
+                 self._adverse_cfg.get("enabled"), self._adverse_cfg.get("mode"),
+                 self._adverse_cfg.get("max_size_ratio"),
+                 self._adverse_cfg.get("history_n"), self._adverse_cfg.get("min_samples"))
+        log.info("M4 guard 2 warmup: enabled=%s min_oracle_samples=%d min_uptime_secs=%.0f "
+                 "(vol_window=%.0fs)", self.warmup.enabled, self.warmup.min_samples,
+                 self.warmup.min_uptime_secs, float(self.config.snipe_cfg["vol_window_secs"]))
+        log.info("M4 guard 3 circuit breaker: daily_limit=%s consecutive_loss_brake=%s "
+                 "override_path=%s",
+                 (f"${self.breaker.daily_limit:.2f}"
+                  if (self.breaker.daily_enabled and self.breaker.daily_limit) else "OFF"),
+                 (self.breaker.max_streak if self.breaker.streak_enabled else "OFF"),
+                 self.config.risk_override_path)
+        _boot = self.breaker.evaluate()
+        if _boot.tripped:
+            log.error("CIRCUIT BREAKER IS ALREADY TRIPPED AT BOOT: %s — the bot will run "
+                      "and track markets but will not open positions until UTC midnight or "
+                      "`python -m polybot.main resume`.", "; ".join(_boot.reasons))
 
         self._http_server = make_server(self.config.status_json_path, self.config.http_port)
         http_thread = threading.Thread(target=self._http_server.serve_forever, daemon=True,
@@ -226,6 +265,7 @@ class Engine:
                 log.exception("tick failed")
             self._update_status_tracked()
             self.status.set_open_positions(self.ledger.all_open_positions())
+            self._publish_guard_status()
             elapsed = time.time() - t0
             self._stop.wait(max(0.0, tick_secs - elapsed))
 
@@ -243,6 +283,14 @@ class Engine:
         self._check_resolutions(now)
 
     # ------------------------------------------------- oracle input selection
+    def _oracle_for(self, market: Market):
+        """The oracle that actually feeds this family's sigma_1s. Returns None
+        for a chainlink family with no oracle running — WarmupGate then reads
+        0 samples and refuses to trade, which is the safe answer."""
+        if market.family == "1h":
+            return self.binance
+        return self.chainlink
+
     def _snipe_inputs(self, market: Market, now: float, cfg: dict):
         """(S_open, S_t, sigma_1s) for this family's oracle, or None to skip.
 
@@ -331,6 +379,31 @@ class Engine:
         if market.slug in self.snipe_done:
             return
 
+        # ---- M4 guard 2: WARMUP. Checked BEFORE any book fetch so a
+        # just-restarted process also stops burning REST calls it cannot act
+        # on. `sigma_1s` from a thin buffer reads too small, which inflates
+        # |z| and therefore `fair` — see risk.WarmupGate.
+        wu = self.warmup.check(self._oracle_for(market), float(cfg["vol_window_secs"]), now)
+        self.warmup.log_progress(wu, market.family, now)
+        if not wu.ready:
+            return
+
+        # ---- M4 guard 3: CIRCUIT BREAKER. Also checked before the book
+        # fetches; re-checked just before the fill is dispatched, because a
+        # resolution can land in between.
+        # Deliberately evaluated on the WALL clock, not the tick's `now`: the
+        # breaker reasons about UTC days and realized PnL, which are wall-clock
+        # facts. Passing a market-derived timestamp here would make the
+        # UTC-day-scoped override compare against the wrong day.
+        br = self.breaker.allow_new_position()
+        if br.tripped:
+            if market.slug not in self._breaker_blocked_slugs:
+                self._breaker_blocked_slugs.add(market.slug)
+                self.status.add_event("risk_block",
+                                       f"close_snipe {market.slug} blocked: "
+                                       f"{'; '.join(br.reasons)}", family=market.family)
+            return
+
         inputs = self._snipe_inputs(market, now, cfg)
         if inputs is None:
             return
@@ -338,6 +411,12 @@ class Engine:
 
         book_up = self.clob.get_book(market.up_token_id)
         book_down = self.clob.get_book(market.down_token_id)
+        # Feed the depth reference from books we already had to fetch — the
+        # adverse-size statistic costs no extra REST traffic.
+        self.depth.observe_book(market.family, book_up, float(cfg["price_min"]),
+                                 float(cfg["price_max"]))
+        self.depth.observe_book(market.family, book_down, float(cfg["price_min"]),
+                                 float(cfg["price_max"]))
 
         sig = evaluate_close_snipe(market, now, S_t, S_open, sigma_1s, book_up, book_down,
                                     cfg, self.config.fee_rate)
@@ -362,6 +441,15 @@ class Engine:
         if self._would_exceed_global_cap():
             log.warning("skipping fill for %s: max_open_notional would be exceeded", market.slug)
             return
+        # re-check the breaker: a resolution may have landed since the gate above
+        br = self.breaker.allow_new_position()
+        if br.tripped:
+            log.error("skipping fill for %s: circuit breaker tripped (%s)",
+                      market.slug, "; ".join(br.reasons))
+            self.status.add_event("risk_block", f"close_snipe {market.slug} fill blocked: "
+                                                 f"{'; '.join(br.reasons)}",
+                                   family=market.family)
+            return
 
         book_at_signal = book_up if sig.side == "up" else book_down
         cap_usd = float(self.config.sizing_cfg["per_event_cap_usd"])
@@ -370,6 +458,10 @@ class Engine:
         price_max = float(cfg["price_max"])
         edge_min = float(cfg["edge_min"])
         fair = sig.fair
+        # M4 guard 1: per-level share ceiling, None when the filter is off or
+        # the depth reference is not yet established.
+        mls = max_level_shares(self._adverse_cfg, self.depth, market.family)
+        mode = str(self._adverse_cfg.get("mode", "cap"))
 
         def edge_fn(p: float, _fair=fair) -> float:
             from .fill_engine import fee_per_share
@@ -377,7 +469,7 @@ class Engine:
 
         self.executor.submit(self._run_fill, "close_snipe", market, sig.side, sig.token_id,
                               edge_fn, edge_min, price_min, price_max, cap_usd, latency_ms,
-                              signal_id, book_at_signal)
+                              signal_id, book_at_signal, None, mls, mode)
 
     # -------------------------------------------------------- settle_sweep
     def _maybe_settle(self, market: Market, now: float) -> None:
@@ -432,6 +524,17 @@ class Engine:
             return
         if self._would_exceed_global_cap():
             return
+        # M4 guard 3 applies to every strategy that OPENS a position, not just
+        # close_snipe — a daily stop that one strategy can walk around is not a
+        # daily stop. Wall clock, same reason as in _maybe_snipe.
+        br = self.breaker.allow_new_position()
+        if br.tripped:
+            if market.slug not in self._breaker_blocked_slugs:
+                self._breaker_blocked_slugs.add(market.slug)
+                self.status.add_event("risk_block", f"settle_sweep {market.slug} blocked: "
+                                                     f"{'; '.join(br.reasons)}",
+                                       family=market.family)
+            return
 
         token_id, edge_fn, edge_min, price_max = settle_sweep_target(market, wd.winner, cfg,
                                                                        self.config.fee_rate)
@@ -445,6 +548,32 @@ class Engine:
                               edge_fn, edge_min, 0.0, price_max, remaining, latency_ms,
                               signal_id, None, self.in_flight_settle)
 
+    # ----------------------------------------------------------- guard status
+    def _publish_guard_status(self) -> None:
+        """Push warmup / breaker / depth state into status.json every tick.
+
+        Wrapped in a try: status reporting must never be able to stop trading.
+        """
+        try:
+            wu = self.warmup.check(self.binance,
+                                    float(self.config.snipe_cfg["vol_window_secs"]))
+            wud = wu.as_dict()
+            wud["oracle"] = "binance"
+            risk = self.breaker.evaluate().as_dict()
+            if not risk["tripped"] and self._breaker_blocked_slugs:
+                # breaker released (UTC rollover or manual resume): allow the
+                # "blocked" event to fire again if it trips a second time
+                self._breaker_blocked_slugs.clear()
+            depth = {
+                "enabled": bool(self._adverse_cfg.get("enabled", False)),
+                "mode": self._adverse_cfg.get("mode", "cap"),
+                "max_size_ratio": self._adverse_cfg.get("max_size_ratio"),
+                "families": self.depth.snapshot(),
+            }
+            self.status.set_guards(wud, risk, depth)
+        except Exception:  # noqa: BLE001
+            log.exception("guard status publish failed")
+
     def _would_exceed_global_cap(self) -> bool:
         max_notional = float(self.config.sizing_cfg["max_open_notional"])
         return self.ledger.total_open_notional() >= max_notional
@@ -453,15 +582,38 @@ class Engine:
     def _run_fill(self, strategy: str, market: Market, side: str, token_id: str, edge_fn,
                   edge_min: float, price_min: float, price_max: float, cap_usd: float,
                   latency_ms: int, signal_id: Optional[int], book_at_signal,
-                  in_flight_set: Optional[Set[str]] = None) -> None:
+                  in_flight_set: Optional[Set[str]] = None,
+                  max_level_shares_: Optional[float] = None,
+                  anomalous_mode: str = "cap") -> None:
         try:
             attempt: FillAttempt = self.router.place_taker_buy(
                 token_id, side, edge_fn, edge_min, price_min, price_max, cap_usd, latency_ms,
-                book_at_signal=book_at_signal,
+                book_at_signal=book_at_signal, max_level_shares=max_level_shares_,
+                anomalous_mode=anomalous_mode,
             )
+            # keep the depth reference fed with the fill-time book too
+            self.depth.observe_book(market.family, attempt.book_at_fill, price_min, price_max)
+            extra_meta = None
+            if max_level_shares_ is not None or attempt.walk.size_filter_bound:
+                extra_meta = {
+                    "adverse_size_max_level_shares": max_level_shares_,
+                    "adverse_size_mode": anomalous_mode,
+                    "adverse_size_levels_capped": attempt.walk.n_levels_capped,
+                    "adverse_size_levels_skipped": attempt.walk.n_levels_skipped,
+                    "adverse_size_shares_suppressed": round(
+                        attempt.walk.shares_suppressed, 4),
+                    "depth_reference": self.depth.reference(market.family),
+                }
             self.ledger.record_fill(strategy=strategy, family=market.family,
                                      market_slug=market.slug, signal_id=signal_id,
-                                     attempt=attempt, edge_min=edge_min)
+                                     attempt=attempt, edge_min=edge_min,
+                                     extra_meta=extra_meta)
+            if attempt.walk.size_filter_bound:
+                self.status.add_event(
+                    "adverse_size", f"{strategy} {market.slug} capped={attempt.walk.n_levels_capped} "
+                                    f"skipped={attempt.walk.n_levels_skipped} "
+                                    f"shares_suppressed={attempt.walk.shares_suppressed:.2f}",
+                    family=market.family)
             if attempt.filled:
                 self.status.add_event(
                     "fill", f"{strategy} {market.slug} side={side} shares="

@@ -492,6 +492,105 @@ def main():
                          p_pnl_le_0=float((pdb <= 0).mean())))
     show(pd.DataFrame(rows), "t9_bootstrap")
 
+    hdr("9b. THE MECHANISM — win rate vs the model's own confidence |z|, POOLED over "
+        "all coins.  If the edge were 'the book has not caught up yet', win rate "
+        "would RISE with |z|.")
+    fz = tr_all[tr_all.outcome == "filled"].copy()
+    fz["zb"] = pd.cut(np.abs(fz.z), [0, 1, 2, 5, 10, 1e12],
+                      labels=["<1", "1-2", "2-5", "5-10", ">10"])
+    gz = (fz.groupby("zb", observed=True)
+            .agg(n=("won", "size"), win=("won", "mean"), ask=("avg_price", "mean"),
+                 ev=("pnl_per_share", "mean"), pnl=("pnl", "sum")).reset_index())
+    show(gz, "t9b_win_by_z")
+    lo = fz[np.abs(fz.z) <= 2]
+    hi = fz[np.abs(fz.z) > 5]
+    if len(lo) and len(hi):
+        try:
+            from scipy.stats import fisher_exact
+            odds, pv = fisher_exact([[int(lo.won.sum()), int((~lo.won).sum())],
+                                     [int(hi.won.sum()), int((~hi.won).sum())]])
+        except Exception:
+            pv = np.nan
+        print(f"|z|<=2: {len(lo)} fills, win {lo.won.mean():.3f}, EV {lo.pnl_per_share.mean()*100:+.2f}c")
+        print(f"|z|> 5: {len(hi)} fills, win {hi.won.mean():.3f}, EV {hi.pnl_per_share.mean()*100:+.2f}c")
+        print(f"Fisher exact p = {pv:.4g}")
+    per = (fz.assign(hi=np.abs(fz.z) > 5).groupby(["coin", "hi"])
+             .agg(n=("won", "size"), win=("won", "mean"),
+                  ev=("pnl_per_share", "mean")).reset_index())
+    show(per, "t9b_win_by_z_percoin")
+
+    hdr("10. POWER — how much live data does it take to KNOW a coin works?\n"
+        "    fills needed for a two-sided t=1.96 on a true +10c/share edge, at the "
+        "per-fill SD each coin actually shows, then converted to calendar days at "
+        "that coin's own fill rate.  x2 for day-clustering (C2 §1.3 measured the "
+        "day-clustered t at about half the per-trade t).")
+    rows = []
+    for c in coins:
+        tr, meta = trades[c]
+        fl = tr[tr.outcome == "filled"]
+        if len(fl) < 2:
+            rows.append(dict(coin=c, fills=len(fl))); continue
+        sd = float(fl.pnl_per_share.std(ddof=1))
+        rate = len(fl) / meta["days"]
+        for target in (0.10,):
+            n_need = (1.96 * sd / target) ** 2
+            rows.append(dict(coin=c, fills=len(fl), sd_per_fill=sd,
+                             fills_per_day=rate, ev_target=target,
+                             n_fills_needed=n_need,
+                             days_needed=n_need / rate if rate else np.inf,
+                             n_fills_needed_dayclust=4 * n_need,
+                             days_needed_dayclust=4 * n_need / rate if rate else np.inf,
+                             observed_t_day=summarise(tr, meta["days"], meta["windows"])["t_day"]))
+    show(pd.DataFrame(rows), "t10_power")
+
+    hdr("11. STRESS KNOBS (each applied alone, then all together), per coin")
+    variants = {
+        "shipped": SHIP,
+        "fee 0.10": replace(SHIP, fee_rate=0.10),
+        "depth 50%": replace(SHIP, depth_fraction=0.5),
+        "latency 3000ms (band narrows)": replace(SHIP, latency_ms=3000),
+        "book age <= 5s": replace(SHIP, max_book_age_s=5.0),
+        "feed lag 300ms": replace(SHIP, feed_lag_ms=300),
+        "tau = nominal (no print-staleness charge)": replace(SHIP, tau_from_print=False),
+        "ALL": replace(SHIP, fee_rate=0.10, depth_fraction=0.5, latency_ms=3000,
+                       max_book_age_s=5.0, feed_lag_ms=300),
+    }
+    rows = []
+    for name, pv in variants.items():
+        agg = []
+        for c in coins:
+            tr, meta = tapes[c].run(pv)
+            tr["coin"] = c
+            agg.append(tr)
+            s = summarise(tr, meta["days"], meta["windows"], c)
+            s.update(variant=name, coin=c)
+            rows.append(s)
+        A = pd.concat(agg, ignore_index=True)
+        A = A[A.outcome == "filled"]
+        nd = len(all_days)
+        daily = A.groupby("day").pnl.sum().reindex(all_days).fillna(0.0) if len(A) \
+            else pd.Series(0.0, index=all_days)
+        rows.append(dict(variant=name, coin="ALL 7", fills=len(A), days=nd,
+                         trades_day=len(A) / nd,
+                         ev_share=A.pnl_per_share.mean() if len(A) else np.nan,
+                         win=A.won.mean() if len(A) else np.nan,
+                         pnl_day=daily.mean(),
+                         t_day=_t(A.groupby("day").pnl_per_share.mean().to_numpy())
+                         if len(A) else np.nan))
+        B = A[A.coin != "bitcoin"]
+        dailyb = B.groupby("day").pnl.sum().reindex(all_days).fillna(0.0) if len(B) \
+            else pd.Series(0.0, index=all_days)
+        rows.append(dict(variant=name, coin="non-BTC", fills=len(B), days=nd,
+                         trades_day=len(B) / nd,
+                         ev_share=B.pnl_per_share.mean() if len(B) else np.nan,
+                         win=B.won.mean() if len(B) else np.nan,
+                         pnl_day=dailyb.mean(),
+                         t_day=_t(B.groupby("day").pnl_per_share.mean().to_numpy())
+                         if len(B) else np.nan))
+    sv = pd.DataFrame(rows)
+    show(sv[["variant", "coin", "fills", "trades_day", "ev_share", "win", "t_day",
+             "pnl_day"]], "t11_stress")
+
     print(f"\nAll CSVs -> {OUT}/")
     return 0
 

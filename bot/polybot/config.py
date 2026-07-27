@@ -118,6 +118,57 @@ class Config:
     def settle_cfg(self) -> Dict[str, Any]:
         return self.raw["strategy"]["settle_sweep"]
 
+    # --- M4 risk guards -------------------------------------------------------
+    # All three read with defaults so a config.yaml written before M4 still
+    # loads. The defaults are the SAFE ones: the adverse-size filter is the one
+    # guard that defaults OFF, and only because measurement said so (see
+    # audit/M4_risk_guards.md §1) — warmup and the circuit breaker default ON
+    # even when the file says nothing.
+    @property
+    def adverse_size_cfg(self) -> Dict[str, Any]:
+        """strategy.close_snipe.adverse_size — the per-level size filter."""
+        cfg = dict(self.snipe_cfg.get("adverse_size") or {})
+        cfg.setdefault("enabled", False)
+        cfg.setdefault("mode", "cap")
+        cfg.setdefault("max_size_ratio", 8.0)
+        cfg.setdefault("history_n", 200)
+        cfg.setdefault("min_samples", 30)
+        return cfg
+
+    @property
+    def warmup_cfg(self) -> Dict[str, Any]:
+        """strategy.close_snipe.warmup — post-restart trading lockout."""
+        cfg = dict(self.snipe_cfg.get("warmup") or {})
+        cfg.setdefault("enabled", True)
+        cfg.setdefault("min_oracle_samples", 60)
+        cfg.setdefault("min_uptime_secs", 90)
+        cfg.setdefault("log_every_secs", 15)
+        return cfg
+
+    @property
+    def risk_cfg(self) -> Dict[str, Any]:
+        """Top-level `risk:` block — daily loss limit + consecutive-loss brake."""
+        cfg = dict(self.raw.get("risk") or {})
+        daily = dict(cfg.get("daily_loss_limit") or {})
+        daily.setdefault("enabled", True)
+        daily.setdefault("bankroll_usd", 1250)
+        daily.setdefault("max_daily_loss_pct", 8.0)
+        cfg["daily_loss_limit"] = daily
+        streak = dict(cfg.get("consecutive_loss_brake") or {})
+        streak.setdefault("enabled", True)
+        streak.setdefault("max_consecutive_losses", 4)
+        cfg["consecutive_loss_brake"] = streak
+        return cfg
+
+    @property
+    def risk_override_path(self) -> Path:
+        """Where `python -m polybot.main resume` writes the manual override.
+        Defaults next to the ledger so `reset_paper_data.sh` archives it."""
+        p = (self.raw.get("risk") or {}).get("override_path")
+        if p:
+            return _resolve_path(str(p))
+        return self.sqlite_path.parent / "risk_override.json"
+
     @property
     def sizing_cfg(self) -> Dict[str, Any]:
         return self.raw["sizing"]

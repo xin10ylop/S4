@@ -16,7 +16,12 @@ python3 scripts/fresh5m/fetch.py outage  --from 2026-06-01 --to 2026-07-26 [--so
 ## 0. Headline
 
 **56 days fetched: 2026-06-01 .. 2026-07-26.** 16,121 markets, all resolved. 32,238 of 32,242
-possible quote tapes (99.99 %), 425.7 M quote rows, 6.1 GB. Book depth for the 19-day target period.
+possible quote tapes (99.99 %), 425.7 M quote rows, 6.1 GB. **Book depth (`book_snapshot_25`) is now
+complete for all 56 days** — 3,986 candidate windows, 114.0 M rows, 3.30 GB, zero fetch failures.
+**All five fetch items are DONE; nothing is outstanding.**
+
+Every headline number below was **independently recomputed from the parquet files on a second pass**
+without re-using the fetcher's own coverage/outage code, and all of them reproduce exactly (§8).
 
 Three findings that change the decision, beyond the raw data:
 
@@ -32,7 +37,10 @@ Three findings that change the decision, beyond the raw data:
    random.** 2026-07-21 04:05:19Z–~04:40Z froze 7 consecutive windows at 56–2073 s of book age,
    matching the verifier's "355–1975 s, one instant at ~04:07 UTC". It is one of **five** such
    multi-market freezes in 56 days, and **every freeze longer than 1400 s begins between 04:00:00
-   and 04:05:20 UTC** — midnight ET, Polymarket's daily rollover. The 04h hour holds **47 % of all
+   and 04:05:20 UTC** — midnight ET, Polymarket's daily rollover. Now confirmed on the *depth*
+   channel too, rescanned over all 56 days: **all 6 book freezes longer than 600 s start in the 04h
+   hour**, five within a 115-second band (04:05:11–04:07:06), and 61 % of frozen markets sit in that
+   one hour (§6). The 04h hour holds **47 % of all
    frozen markets against a 4.17 % baseline (11×)**. This is a recurring scheduled disturbance, not
    bad luck. §6.
 
@@ -143,8 +151,10 @@ measured at all. Nothing is forward-filled and nothing is dropped for staleness.
 ## 4. Item 4 — book_snapshot_25 for candidate windows. COMPLETE for the target period
 
 `data/fresh5m/books/<D>.parquet`, 25 levels per side, trimmed to `[close − 45 s, close + 2 s]` plus
-the last pre-cut row. **19 days (2026-07-08..2026-07-26), 1,343 windows, 29.9 M rows, 1.03 GB, zero
-fetch failures.** Candidate list: `data/fresh5m/candidates.parquet`.
+the last pre-cut row. **COMPLETE FOR ALL 56 DAYS (2026-06-01..2026-07-26): 3,986 windows,
+113,954,418 rows, 3.30 GB, zero fetch failures** — the remaining 30 days (2026-06-08..2026-07-07)
+were fetched on the second pass, every day reporting `fails=0`. Candidate list:
+`data/fresh5m/candidates.parquet`.
 
 Selection (`prepass`) keeps a window if, at any τ ∈ {2,3,4,5} s, some outcome's last ask is in
 (0.30, 0.99) and `fair − ask − fee > 0` — **edge_min = 0, strictly more generous than the shipped
@@ -234,12 +244,22 @@ moved. Any fill simulated there is against liquidity never observed to exist.
 **Confirmed independently on the `book_snapshot_25` channel** (`fetch.py outage --source books`,
 `outage_clusters_books.parquet`), a different vendor channel from the quote tape above:
 
-| day | first frozen update (UTC) | markets | age range |
+Now rescanned over **all 56 days** of depth (was 19). **19 episodes, 54 frozen markets.** Every
+episode longer than 600 s:
+
+| day | first frozen update (UTC) | markets | max age |
 |---|---|---|---|
-| 2026-07-21 | **04:07:06.907** | 6 | **356.6 – 1923.0 s** |
-| 2026-07-10 | 04:06:31.589 | 1 | 205.4 s |
-| 2026-07-08 | 21:16:56.460 | 1 | 180.5 s |
-| 2026-07-24 | 04:03:34.648 | 1 | 82.4 s |
+| **2026-07-01** | **04:05:31.018** | 7 | **2365.6 s** |
+| **2026-06-24** | **04:05:54.000** | 6 | **2043.0 s** |
+| **2026-07-21** | **04:07:06.907** | 6 | **1923.0 s** ← the A3 one |
+| **2026-06-19** | **04:05:15.765** | 5 | **1481.2 s** |
+| **2026-06-10** | **04:05:11.696** | 5 | **1185.3 s** |
+| **2026-06-19** | **04:58:17.655** | 2 | **699.3 s** |
+
+**All six start in the 04h hour**, five of them inside a 115-second band (04:05:11–04:07:06). On the
+depth channel the concentration is even sharper than on quotes: **33 of 54 frozen markets (61.1 %)
+sit in the one hour that carries 4.17 % of closes — a 14.7× concentration.** Two independent vendor
+channels, 56 days, same conclusion.
 
 356.6–1923.0 s at 04:07:06Z reproduces the verifier's "355–1975 s at ~04:07 UTC" to within a few
 seconds, from an independent re-fetch. The depth channel and the top-of-book channel froze together,
@@ -343,10 +363,8 @@ mechanism A1 warned would "manufacture an edge that does not exist." Any replay 
 - **Quote tape is trimmed to 120 s pre-close** (books to 45 s). Anything needing the full 5-minute
   tape — e.g. modelling intra-window drift from the window open — must re-fetch. Disk, not the
   vendor, was the binding constraint.
-- **book_snapshot_25 is candidate-only by design, and complete only for 2026-07-08..2026-07-26.**
-  Rejected windows have quotes but no depth; the 12 controls/day are the check on that. June +
-  Jul 1–7 books were still downloading at write time — resume with
-  `fetch.py books --from 2026-06-01 --to 2026-07-07`.
+- **book_snapshot_25 is candidate-only by design** (~71 of 288 windows/day), now complete for all
+  56 days. Rejected windows have quotes but no depth; the 12 controls/day are the check on that.
 - **June 10 and June 11 Chainlink coverage is 80 % / 49 % with multi-hour holes** — exclude them or
   the June leg of the stationarity test measures vendor downtime. June 1, 3, 4, 5 and July 7 are
   partially degraded. Note June 10 and June 19 also carry book freezes, so June's bad days are bad
