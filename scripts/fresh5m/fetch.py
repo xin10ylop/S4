@@ -487,28 +487,41 @@ def stage_outage(days, min_markets: int = 3, min_age: float = 20.0, source: str 
         stale = rd[rd.age_s >= min_age]
         per_day.append((d, len(rd), len(stale), float(rd.age_s.median()),
                         float(rd.age_s.quantile(0.99)), float(rd.age_s.max())))
-        gg = stale.groupby("last_update_us").agg(n_mkts=("close_s", "nunique"),
-                                                 n_obs=("close_s", "size"),
-                                                 max_age=("age_s", "max"),
-                                                 min_age=("age_s", "min"))
-        gg = gg[gg.n_mkts >= min_markets]
-        for ts_us, r in gg.iterrows():
-            hits.append((d, int(ts_us),
-                         pd.Timestamp(int(ts_us), unit="us", tz="UTC").isoformat(),
-                         int(r.n_mkts), int(r.n_obs), float(r.min_age), float(r.max_age)))
+        # OUTAGE EPISODE = a maximal run of CONSECUTIVE 5m closes in which at
+        # least one outcome's book was frozen. Grouping on an exact identical
+        # microsecond instant (the A3 write-up's phrasing) under-counts: the two
+        # outcomes of one market share an instant, but neighbouring markets each
+        # froze on their own last tick a few seconds apart. What identifies a
+        # vendor outage is that the last-update instants all predate a common
+        # cutoff while the decision instants march on.
+        st = stale.sort_values("close_s")
+        if len(st):
+            cs_all = np.sort(rd.close_s.unique())
+            pos = {int(c): i for i, c in enumerate(cs_all)}
+            idx = np.array([pos[int(c)] for c in st.close_s.unique()])
+            idx.sort()
+            brk = np.flatnonzero(np.diff(idx) > 1) + 1
+            for run in np.split(idx, brk):
+                mkts = cs_all[run]
+                ep = st[st.close_s.isin(set(mkts.tolist()))]
+                hits.append((d, int(ep.last_update_us.min()),
+                             pd.Timestamp(int(ep.last_update_us.min()), unit="us", tz="UTC").isoformat(),
+                             int(ep.close_s.nunique()), int(len(ep)),
+                             float(ep.age_s.min()), float(ep.age_s.max())))
+        gg = st
         print(f"  outage {d} obs={len(rd)} stale>={min_age}s:{len(stale)} "
-              f"clusters={len(gg)} med_age={rd.age_s.median():.2f}s "
+              f"episodes={st.close_s.nunique() if len(st) else 0} med_age={rd.age_s.median():.2f}s "
               f"p99={rd.age_s.quantile(0.99):.1f}s max={rd.age_s.max():.0f}s", flush=True)
-    h = pd.DataFrame(hits, columns=["d", "last_update_us", "last_update_utc", "n_markets",
-                                    "n_obs", "min_age_s", "max_age_s"])
-    h.sort_values("n_markets", ascending=False).to_parquet(
+    h = pd.DataFrame(hits, columns=["d", "first_frozen_update_us", "first_frozen_update_utc",
+                                    "n_markets", "n_obs", "min_age_s", "max_age_s"])
+    h.sort_values("max_age_s", ascending=False).to_parquet(
         f"{OUT}/outage_clusters_{source}.parquet", index=False)
     pd.DataFrame(per_day, columns=["d", "n_obs", "n_stale", "med_age_s", "p99_age_s", "max_age_s"]
                  ).to_parquet(f"{OUT}/age_by_day_{source}.parquet", index=False)
-    print(f"[outage] {len(h)} clusters (>= {min_markets} distinct markets sharing one "
-          f"last-update instant, age >= {min_age}s)")
+    print(f"[outage/{source}] {len(h)} outage EPISODES (runs of consecutive closes with a "
+          f"frozen book, age >= {min_age}s)")
     if len(h):
-        print(h.sort_values("n_markets", ascending=False).head(40).to_string())
+        print(h.sort_values("max_age_s", ascending=False).head(40).to_string(index=False))
     return h
 
 
