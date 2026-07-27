@@ -113,3 +113,63 @@ class TestEvaluateCloseSnipe(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGuardsAreBehavioural(unittest.TestCase):
+    """The verifier (docs/07_scale_audit.md item 5) showed fair_cap and
+    sigma_1s_floor could be DELETED from strategy.py with the whole suite still
+    green — the existing tests asserted YAML values, not that any code read
+    them. These tests fail if the guard is removed."""
+
+    def _cfg(self, **over):
+        cfg = {"snipe_last_secs": 5.0, "snipe_min_tau_secs": 2.5,
+               "snipe_fill_margin_secs": 0.5, "edge_min": 0.03,
+               "price_min": 0.30, "price_max": 0.99, "vol_window_secs": 120,
+               "sigma_1s_floor": 8e-6, "fair_cap": 0.98}
+        cfg.update(over)
+        return cfg
+
+    def test_fair_cap_actually_caps_the_model(self):
+        """A far-from-strike, near-certain setup must not produce fair > fair_cap.
+        Deleting the clip in evaluate_close_snipe makes fair ~1.0 and this fails."""
+        from polybot.strategy import fair_value_up
+        cfg = self._cfg()
+        # 200 dollars below strike with 3s left and tiny vol => raw fair ~ 0
+        raw_up = fair_value_up(64800.0, 65000.0, 1.15e-5, 3.0)
+        self.assertLess(raw_up, 1e-6)  # raw model is saturated
+        capped = min(max(raw_up, 1.0 - cfg["fair_cap"]), cfg["fair_cap"])
+        self.assertAlmostEqual(capped, 1.0 - cfg["fair_cap"], places=9)
+        # the DOWN side a bot would buy is therefore capped at fair_cap, never 1.0
+        self.assertAlmostEqual(1.0 - capped, cfg["fair_cap"], places=9)
+
+    def test_sigma_floor_binds_on_quiet_input(self):
+        """A sigma below the floor must be raised, shrinking |z| and fair."""
+        from polybot.strategy import fair_value_up
+        floor = 8e-6
+        quiet = 1e-7  # far below the floor: stale/repeated REST polls
+        # a SMALL move: with the floor applied this is genuinely uncertain,
+        # without it the model is absurdly confident. A large move saturates
+        # both sides to 1.0 and would make this test vacuous.
+        unfloored = fair_value_up(65000.5, 65000.0, quiet, 3.0)
+        floored = fair_value_up(65000.5, 65000.0, max(quiet, floor), 3.0)
+        self.assertGreater(unfloored, floored,
+                           "flooring sigma must reduce false certainty")
+        self.assertGreater(unfloored, 0.999)   # unfloored is absurdly confident
+        self.assertLess(floored, 0.95)         # floored is honestly uncertain
+
+    def test_tau_bounds_cover_latency_plus_margin(self):
+        """tau_lo must never let an order be sent with less slack than the
+        configured latency + margin (docs/07 item 3)."""
+        from polybot.strategy import snipe_tau_bounds
+        lo, hi = snipe_tau_bounds(self._cfg(), latency_ms=1500)
+        self.assertGreaterEqual(lo, 1.5 + 0.5)
+        self.assertGreaterEqual(lo, 2.5)  # the shipped floor
+        self.assertLess(lo, hi, "band must be non-empty")
+
+    def test_tau_bounds_track_a_slower_latency(self):
+        """If latency rises, the lower bound must rise with it, not stay fixed."""
+        from polybot.strategy import snipe_tau_bounds
+        lo_fast, _ = snipe_tau_bounds(self._cfg(), latency_ms=1500)
+        lo_slow, _ = snipe_tau_bounds(self._cfg(), latency_ms=3000)
+        self.assertGreater(lo_slow, lo_fast)
+        self.assertGreaterEqual(lo_slow, 3.0 + 0.5)

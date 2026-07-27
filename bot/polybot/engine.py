@@ -69,6 +69,7 @@ class Engine:
         # live — see docs/05_clob_api_spec.md), so stop hammering after a few
         # consecutive empties instead of retrying for the whole window.
         self.settle_empty_streak: Dict[str, int] = {}
+        self._snipe_family_warned: Set[str] = set()
 
         self._stop = threading.Event()
         self._threads: list = []
@@ -304,6 +305,21 @@ class Engine:
     # --------------------------------------------------------- close_snipe
     def _maybe_snipe(self, market: Market, now: float) -> None:
         cfg = self.config.snipe_cfg
+        # SAFETY ALLOWLIST (restores the guard deleted in the tau-band refactor;
+        # see docs/07_scale_audit.md item 4). Without this, flipping one YAML
+        # boolean arms 5m/15m/4h at the $250 clip on 1h-calibrated edge_min and
+        # window, which the verifier showed loses money on 5m (-$58/day at $250).
+        # The families here have been validated for close_snipe; adding one is a
+        # deliberate act that must follow the go/no-go in docs/07 sec. 6.
+        allowed = cfg.get("allowed_families", ["1h"])
+        if market.family not in allowed:
+            if market.slug not in self._snipe_family_warned:
+                self._snipe_family_warned.add(market.slug)
+                log.warning("close_snipe is enabled for family %s in config but %s is NOT in "
+                            "strategy.close_snipe.allowed_families=%s — refusing to trade it. "
+                            "See docs/07_scale_audit.md before adding it.",
+                            market.family, market.family, allowed)
+            return
         tau_lo, tau_hi = snipe_tau_bounds(cfg, int(self.config.execution_cfg["latency_ms"]))
         tau = market.close_ts - now
         # tau_lo is NOT a "too late, give up" case we can log usefully — it is

@@ -30,7 +30,8 @@ class TestConfigLoading(unittest.TestCase):
         self.assertEqual(c.families()["1h"].settle_sweep, False)   # (iv) 1235 signals, 0 fills
         self.assertAlmostEqual(c.snipe_cfg["edge_min"], 0.03)      # (ii)
         self.assertEqual(c.snipe_cfg["snipe_last_secs"], 5)        # (i)
-        self.assertAlmostEqual(c.snipe_cfg["snipe_min_tau_secs"], 2.0)
+        self.assertAlmostEqual(c.snipe_cfg["snipe_min_tau_secs"], 2.5)  # raised: docs/07 item 3
+        self.assertEqual(c.snipe_cfg["allowed_families"], ["1h"])       # docs/07 item 4
         self.assertAlmostEqual(c.snipe_cfg["snipe_fill_margin_secs"], 0.5)
         self.assertEqual(c.sizing_cfg["per_event_cap_usd"], 250)   # (iii)
         self.assertEqual(c.sizing_cfg["max_open_notional"], 1000)

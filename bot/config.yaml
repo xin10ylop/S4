@@ -112,7 +112,19 @@ strategy:
                                  # tau=6 signals carry 6s of unresolved BTC risk against a
                                  # `fair` frozen at signal time; at a $250 clip every large
                                  # loss came from there (worst single trade -$258.75).
-    snipe_min_tau_secs: 2.0      # NEW. Floor on the lower tau bound.
+    # Hard allowlist enforced in engine._maybe_snipe, independent of the per-family
+    # `close_snipe` booleans above. Restores the guard deleted in the tau-band
+    # refactor (docs/07_scale_audit.md item 4): a family must be BOTH enabled above
+    # AND listed here. 5m/15m/4h are deliberately absent — the verifier measured
+    # corrected 5m at +0.87c (t=0.22) at these shipped parameters, i.e. -$58/day at
+    # the $250 clip. Do not add one without re-running the go/no-go in docs/07 sec.6.
+    allowed_families: ["1h"]
+    snipe_min_tau_secs: 2.5      # was 2.0. The bound must also cover the two blocking
+                                 # /book fetches between the gate and the fill worker
+                                 # (measured delta_book: median 0.315s, cold 0.791s).
+                                 # At 2.0 the real fill margin was +0.19s median and
+                                 # NEGATIVE on a cold connection — i.e. orders landing
+                                 # at/after the close. docs/07_scale_audit.md item 3.
     snipe_fill_margin_secs: 0.5  # NEW. Required slack between order arrival and the close.
                                  # tau=1 signals filled 0/46 times (42 hit an empty book);
                                  # in LIVE that is a real order sent into a closed market.

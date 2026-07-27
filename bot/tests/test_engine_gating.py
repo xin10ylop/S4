@@ -169,7 +169,7 @@ class TestSnipeWindowGate(_EngineTestBase):
     def test_no_fire_at_legacy_tau_values(self):
         # The old gate was (0, 6]; every tau it admitted that the new one does
         # not must now be silent.
-        for tau in (0.02, 0.5, 1.0, 1.5, 5.5, 6.0):
+        for tau in (0.02, 0.5, 1.0, 1.5, 2.0, 5.5, 6.0):
             self.engine.snipe_done.clear()
             self.engine._maybe_snipe(self._market_at_tau(tau), self.now)
         self.assertEqual(self.submissions, [])
@@ -182,7 +182,9 @@ class TestSnipeWindowGate(_EngineTestBase):
         self.assertEqual(len(self.engine.ledger.snipe_signals), 1)
 
     def test_fires_at_band_edges(self):
-        for i, tau in enumerate((2.0, 5.0)):
+        # tau_lo is 2.5 (snipe_min_tau_secs raised from 2.0 in docs/07 item 3 so
+        # the bound also covers the two blocking /book fetches).
+        for i, tau in enumerate((2.5, 5.0)):
             m = self._market_at_tau(tau, slug=f"edge{i}")
             self.engine._maybe_snipe(m, self.now)
         self.assertEqual(len(self.submissions), 2)
