@@ -247,6 +247,13 @@ class P:
     gate_mode: str = "flat"
     tau_min: float = 0.0            # only consider decisions with tau in
     tau_max: float = 1e9            # [tau_min, tau_max] seconds to close
+    # BOOK SANITY.  A book quoting ask <= bid is impossible on a real matching
+    # engine, so such a snapshot is a vendor defect and anything derived from it
+    # is fiction.  max_spread rejects books so wide that the touch is not a
+    # price anyone is really trading at (the 15m book is >5c wide 51% of the
+    # time, so this is the single most important sensitivity here).
+    require_uncrossed: bool = True
+    max_spread: float = INF
 
 
 def _grid(t0: int, t1: int, tapes: Sequence[Tape], hz: float) -> np.ndarray:
@@ -298,6 +305,13 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     ja, jb = np.clip(ia, 0, None), np.clip(ib, 0, None)
     ask_lo = np.where(ok, A.ask[ja], np.nan)
     bid_hi = np.where(ok, B.bid[jb], np.nan)
+    spr_a = np.where(ok, A.ask[ja] - A.bid[ja], np.nan)
+    spr_b = np.where(ok, B.ask[jb] - B.bid[jb], np.nan)
+    sane = np.ones(len(grid), bool)
+    if p.require_uncrossed:
+        sane &= (spr_a > 0) & (spr_b > 0)
+    if np.isfinite(p.max_spread):
+        sane &= (spr_a <= p.max_spread) & (spr_b <= p.max_spread)
     fresh = (aa <= p.max_book_age_s) & (ab <= p.max_book_age_s)
     # the Down leg is reconstructed as (1 - bid_Up); charge the haircut to the
     # detected gap so a reconstruction error cannot manufacture a signal.
@@ -309,7 +323,7 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
         need = np.full(len(grid), p.gap_min)
     tau_g = (close_us - grid) / 1e6
     in_tau = (tau_g >= p.tau_min) & (tau_g <= p.tau_max)
-    live = ok & _valid(ask_lo) & _valid(bid_hi) & (gap > need) & in_tau
+    live = ok & _valid(ask_lo) & _valid(bid_hi) & (gap > need) & in_tau & sane
     sig = live & fresh if p.require_both_fresh else live
     if p.persist_ms > 0 and sig.any():
         # rs[i] = grid time at which the CURRENT unbroken `live` run began
@@ -338,6 +352,7 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
                ask_lo_sig=float(ask_lo[k]), bid_hi_sig=float(bid_hi[k]),
                gap_sig=float(gap[k]),
                age_a_sig=float(aa[k]), age_b_sig=float(ab[k]),
+               spr_a_sig=float(spr_a[k]), spr_b_sig=float(spr_b[k]),
                n_violation_ticks=int(live.sum()),
                stale_blocked=int((live & ~fresh).sum()))
 
@@ -365,7 +380,9 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     ask_lo_f = float(A.ask[fa[0]])
     bid_hi_f = float(B.bid[fb[0]])
     rec.update(ask_lo_fil=ask_lo_f, bid_hi_fil=bid_hi_f,
-               gap_fil=bid_hi_f - ask_lo_f)
+               gap_fil=bid_hi_f - ask_lo_f,
+               spr_a_fil=float(A.ask[fa[0]] - A.bid[fa[0]]),
+               spr_b_fil=float(B.ask[fb[0]] - B.bid[fb[0]]))
     stale_fill = (aga[0] > p.max_book_age_s) or (agb[0] > p.max_book_age_s)
     rec["stale_fill"] = bool(stale_fill)
     if stale_fill:

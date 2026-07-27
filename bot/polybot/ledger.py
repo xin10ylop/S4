@@ -318,6 +318,59 @@ class Ledger:
                 fees += r["fees_usd"]
         return {"n": n, "gross_pnl": gross, "fees_paid": fees, "net_pnl": gross - fees}
 
+    # --- circuit-breaker inputs (M4 guard 3) -----------------------------------
+    def recent_trade_pnls(self, limit: int = 50,
+                           since_ts: Optional[float] = None) -> List[tuple]:
+        """[(resolved_ts, market_slug, net_realized_pnl), ...] most recent first.
+
+        One row per RESOLVED MARKET, not per fill row: a market that filled on
+        both a close_snipe and a settle_sweep leg resolved once and is one
+        outcome for streak purposes. `since_ts` bounds how far back to look
+        (used to scope the streak to the current UTC day).
+        """
+        sql = ("SELECT resolved_ts, market_slug, pnl_json FROM resolutions "
+               "WHERE resolved_ts IS NOT NULL")
+        params: list = []
+        if since_ts is not None:
+            sql += " AND resolved_ts >= ?"
+            params.append(float(since_ts))
+        sql += " ORDER BY resolved_ts DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        out = []
+        for resolved_ts, slug, pnl_json in rows:
+            if not pnl_json:
+                continue
+            recs = json.loads(pnl_json)
+            if not recs:
+                continue  # resolved with no position: not a trade
+            out.append((resolved_ts, slug, sum(r["realized_pnl"] for r in recs)))
+        return out
+
+    def consecutive_losses(self, since_ts: Optional[float] = None,
+                            limit: int = 200) -> int:
+        """Number of most-recent resolved trades that lost, unbroken.
+
+        A trade with pnl exactly 0 (possible only if a fill is fully refunded)
+        breaks the streak — a streak is evidence of repeated *losing*, and we
+        do not want float dust to extend one.
+        """
+        n = 0
+        for _ts, _slug, pnl in self.recent_trade_pnls(limit=limit, since_ts=since_ts):
+            if pnl < 0:
+                n += 1
+            else:
+                break
+        return n
+
+    def n_resolved_trades(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM resolutions WHERE resolved_ts IS NOT NULL"
+            ).fetchone()
+        return int(row[0])
+
     def is_resolution_pending(self, market_slug: str) -> bool:
         with self._lock:
             row = self._conn.execute(

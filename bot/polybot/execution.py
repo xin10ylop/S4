@@ -101,6 +101,8 @@ class ExecutionRouter:
         cap_usd: float,
         latency_ms: int,
         book_at_signal=None,
+        max_level_shares: Optional[float] = None,
+        anomalous_mode: str = "cap",
     ) -> FillAttempt:
         """Unified entry point used by the engine for both strategies.
 
@@ -108,17 +110,24 @@ class ExecutionRouter:
         (fill_engine.execute_taker_signal) — this is the faithful simulation.
         LIVE: places one real FAK (fill-and-kill / IOC) taker order sized off
         a fresh book walk. See module docstring for verification status.
+
+        `max_level_shares`/`anomalous_mode` are the adverse-size filter (M4
+        guard 1) and are threaded into BOTH paths on purpose — a risk guard
+        that only exists in the simulator is not a risk guard.
         """
         max_above_best = self.config.execution_cfg.get("max_walk_above_best", 0.03)
         if max_above_best is not None:
             max_above_best = float(max_above_best)
         if self.is_live():
             return self._place_live_order(token_id, side, edge_fn, edge_min, price_min,
-                                           price_max, cap_usd, max_above_best)
+                                           price_max, cap_usd, max_above_best,
+                                           max_level_shares=max_level_shares,
+                                           anomalous_mode=anomalous_mode)
         return execute_taker_signal(
             self.clob_rest, token_id, side, edge_fn, edge_min, price_min, price_max, cap_usd,
             self.config.fee_rate, latency_ms, book_at_signal=book_at_signal, sleep=True,
-            max_above_best=max_above_best,
+            max_above_best=max_above_best, max_level_shares=max_level_shares,
+            anomalous_mode=anomalous_mode,
         )
 
     def _get_live_client(self):
@@ -175,6 +184,8 @@ class ExecutionRouter:
         self, token_id: str, side: str, edge_fn: Callable[[float], float], edge_min: float,
         price_min: float, price_max: float, cap_usd: float,
         max_above_best: Optional[float] = 0.03,
+        max_level_shares: Optional[float] = None,
+        anomalous_mode: str = "cap",
     ) -> FillAttempt:
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
@@ -203,12 +214,15 @@ class ExecutionRouter:
         # between our GET /book and the order reaching the matching engine)
         # and cancels the remainder, so over-sizing the limit is safe.
         walk = walk_asks(book.asks, edge_fn, edge_min, price_min, price_max, cap_usd,
-                          self.config.fee_rate, max_above_best=max_above_best)
+                          self.config.fee_rate, max_above_best=max_above_best,
+                          max_level_shares=max_level_shares,
+                          anomalous_mode=anomalous_mode)
         if walk.total_shares <= 0:
             return FillAttempt(token_id=token_id, side=side, signal_time=signal_time,
                                 fill_time=time.time(), latency_ms=0, book_at_signal=book,
                                 book_at_fill=book, walk=WalkResult(), edge_min=edge_min,
-                                outcome="book_moved_no_edge")
+                                outcome=("adverse_size_blocked" if walk.n_levels_skipped
+                                         else "book_moved_no_edge"))
 
         limit_price = walk.fills[-1].price
         size = walk.total_shares

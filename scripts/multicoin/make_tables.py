@@ -38,18 +38,22 @@ def fmt(v, nd=2, money=False, pct=False):
 
 def liq_table():
     q = pd.read_csv(f"{OUT}/quote_summary_by_coin.csv").set_index("coin")
-    rows = ["| coin | days | closes | frac ask in band | median ask depth (USD) | p25 / p75 | median quote age | median updates in last 120 s | indicative signals/day |",
-            "|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| coin | days | closes | frac ask in band | median ask depth (USD) | p25 / p75 | median quote age | p90 quote age | updates in last 120 s | indicative signals/day | **band→signal conversion** |",
+            "|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in DISPLAY:
         if c not in q.index:
             continue
         r = q.loc[c]
+        conv = (r.indic_signals_per_day / 24) / r.frac_close_ask_in_band
         rows.append(
             f"| {c} | {int(r.days)} | {int(r.closes)} | **{fmt(r.frac_close_ask_in_band, pct=True)}** | "
             f"{fmt(r.med_ask_usd, money=True)} | {fmt(r.p25_ask_usd, money=True)} / {fmt(r.p75_ask_usd, money=True)} | "
-            f"{fmt(r.med_quote_age_s)} s | {fmt(r.med_upd_120s, 0)} | **{fmt(r.indic_signals_per_day)}** |")
+            f"{fmt(r.med_quote_age_s)} s | {fmt(r.p90_quote_age_s)} s | {fmt(r.med_upd_120s, 0)} | "
+            f"**{fmt(r.indic_signals_per_day)}** | **{fmt(conv, pct=True)}** |")
     tot = q.indic_signals_per_day.sum()
-    rows.append(f"| **TOTAL** | | | | | | | | **{tot:.2f}/day** |")
+    nonbtc = tot - q.loc["bitcoin", "indic_signals_per_day"]
+    rows.append(f"| **TOTAL** | | | | | | | | | **{tot:.2f}/day** | |")
+    rows.append(f"| *of which new (non-BTC)* | | | | | | | | | *{nonbtc:.2f}/day* | |")
     return "\n".join(rows)
 
 
@@ -87,10 +91,16 @@ def summary_table():
 
 
 def splice(doc, marker, table):
-    pat = re.compile(rf"(<!--{marker}-->)(.*?)(?=\n\n|\Z)", re.S)
+    """Replace everything between the marker and the next heading/rule.
+
+    Anchoring on the next structural element (not the next blank line) is what
+    makes this idempotent -- a blank-line anchor stops inside the table it just
+    wrote and leaves the previous one stranded below it.
+    """
+    pat = re.compile(rf"(<!--{marker}-->)(.*?)(?=\n(?:#{{2,3}} |---\n|\Z))", re.S)
     if not pat.search(doc):
         raise SystemExit(f"marker {marker} not found")
-    return pat.sub(lambda m: m.group(1) + "\n\n" + table, doc)
+    return pat.sub(lambda m: m.group(1) + "\n\n" + table + "\n", doc)
 
 
 def main():

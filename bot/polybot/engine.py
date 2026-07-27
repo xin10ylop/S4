@@ -18,12 +18,14 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Set
 
 from .config import Config
+from .depth import DepthTracker, max_level_shares
 from .execution import ExecutionRouter
 from .fill_engine import FillAttempt
 from .ledger import Ledger
 from .logging_setup import get_logger
 from .oracle import BinanceOracle, ChainlinkOracle
 from .polymarket import ClobClientREST, GammaClient, Market, discover_markets
+from .risk import CircuitBreaker, WarmupGate
 from .status_server import StatusState, make_server, write_status_loop
 from .strategy import (evaluate_close_snipe, resolve_winner, settle_sweep_target,
                        snipe_tau_bounds)

@@ -149,6 +149,32 @@ def build_sets() -> Dict[str, dom.P]:
                                                               "clip_usd": c})
     S["feegate10_slack50"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
                                                     "slack_frac": 0.5})
+    # --- BOOK SANITY sensitivities ---------------------------------------
+    S["sane_off"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                           "require_uncrossed": False})
+    for ms in (0.05, 0.10, 0.20):
+        S[f"maxspr{int(ms*100)}"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                           "max_spread": ms})
+    # the fully defensible rule: fee gate + 1c, both books uncrossed and <=10c
+    # wide, crossing must persist 500ms, Down-leg haircut, local capture clock
+    S["final"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee", "max_spread": 0.10,
+                                        "persist_ms": 500, "dn_haircut": 0.005,
+                                        "clock": "local"})
+    for L in (0, 250, 500, 1000):
+        S[f"final_lat{L}"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                    "max_spread": 0.10, "persist_ms": 500,
+                                                    "dn_haircut": 0.005, "clock": "local",
+                                                    "latency_ms": L})
+    for c in (100.0, 250.0):
+        S[f"final_clip{int(c)}"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                          "max_spread": 0.10,
+                                                          "persist_ms": 500,
+                                                          "dn_haircut": 0.005,
+                                                          "clock": "local", "clip_usd": c})
+    S["final_slack50"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee",
+                                                "max_spread": 0.10, "persist_ms": 500,
+                                                "dn_haircut": 0.005, "clock": "local",
+                                                "slack_frac": 0.5})
     # --- tau buckets (the signal set is bimodal in time-to-close) --------
     S["tau_late"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee", "tau_max": 30.0})
     S["tau_early"] = dom.P(gap_min=0.01, **{**BASE, "gate_mode": "fee", "tau_min": 30.0})

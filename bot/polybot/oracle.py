@@ -88,6 +88,21 @@ class BinanceOracle:
     def latest(self) -> Optional[PricePoint]:
         return self._series[-1] if self._series else None
 
+    def n_samples(self, window_secs: float = 120.0) -> int:
+        """How many price points the rolling buffer holds inside the trailing
+        `window_secs`, measured from NOW (not from the newest point).
+
+        This is the warmup statistic (risk.WarmupGate). Anchoring on wall-clock
+        rather than on the newest sample matters: a poller that died 10 minutes
+        ago still holds 120 points, and anchoring on the newest point would
+        report a full buffer for a feed that has stopped. Anchored on now, that
+        same buffer correctly reports 0.
+        """
+        if not self._series:
+            return 0
+        now = time.time()
+        return sum(1 for p in self._series if now - p.ts <= window_secs)
+
     def rolling_log_return_std(self, window_secs: float = 120.0) -> float:
         """Std of 1-step log returns over the trailing `window_secs`.
 
@@ -756,6 +771,18 @@ class ChainlinkOracle:
         if o is None or c is None:
             return None
         return "up" if c.wei >= o.wei else "down"
+
+    def n_samples(self, window_secs: float = 120.0) -> int:
+        """Observation seconds held inside the trailing `window_secs`, measured
+        from the clock (not from the newest print) — same contract and same
+        reason as BinanceOracle.n_samples: a dead feed must report 0, not a
+        full buffer. Used by risk.WarmupGate."""
+        with self._lock:
+            if self._newest_sec is None:
+                return 0
+            now = int(self._clock())
+            oldest = int(now - window_secs)
+            return sum(1 for s in self._px if oldest <= s <= now)
 
     def rolling_log_return_std(self, window_secs: float = 120.0) -> float:
         """Std of 1s log returns over the trailing `window_secs`, on the
