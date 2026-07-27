@@ -10,3 +10,4 @@ datasets/
 bot/**/__pycache__/
 bot/data/
 *.db
+logs/
