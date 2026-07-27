@@ -557,6 +557,10 @@ class Engine:
         try:
             wu = self.warmup.check(self.binance,
                                     float(self.config.snipe_cfg["vol_window_secs"]))
+            # Log warmup progress from the TICK loop, not only from a gated
+            # snipe: after a restart the next 1h close can be ~an hour away, and
+            # "silently not trading" must never look like "nothing to trade".
+            self.warmup.log_progress(wu, "startup")
             wud = wu.as_dict()
             wud["oracle"] = "binance"
             risk = self.breaker.evaluate().as_dict()

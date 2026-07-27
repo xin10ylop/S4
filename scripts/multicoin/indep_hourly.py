@@ -110,7 +110,8 @@ def run(coin, days):
                 if not np.isfinite(r.ask_price):
                     return None, age
                 sz = float(r.ask_size) if np.isfinite(r.ask_size) and r.ask_size > 0 else 0.0
-                return (float(r.ask_price), sz), age
+                # snap float32 back onto the venue's decimal tick grid
+                return (round(float(r.ask_price), 4), sz), age
 
             fired = False
             for tau in TAUS:

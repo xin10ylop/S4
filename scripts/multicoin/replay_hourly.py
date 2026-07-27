@@ -273,9 +273,17 @@ def load_coin_windows(coin: str, days: Optional[Sequence[str]] = None) -> List[H
             if gg.empty:
                 tapes[oid] = _empty_tape()
                 continue
+            # PRICE PRECISION.  The tape stores prices as float32, so a quote of
+            # exactly 0.30 comes back as 0.30000001192092896 in float64 and
+            # sneaks past the bot's STRICT `price_min < ask` guard.  The live
+            # bot parses JSON decimals into float64, where 0.3 is 0.3 and the
+            # guard rejects it.  Three of 176 fills in the 81-day sample were
+            # admitted by that artifact alone and they carried -$194.7 of P&L.
+            # Snap back to the venue's decimal grid (tick is 0.001 or 0.01,
+            # M1 section 2.2) before anything compares against a threshold.
             tapes[oid] = BookTape(
                 gg.timestamp_us.to_numpy(np.int64),
-                gg.ask_price.to_numpy(float)[:, None],
+                np.round(gg.ask_price.to_numpy(float), 4)[:, None],
                 gg.ask_size.to_numpy(float)[:, None])
         out.append(HWindow(coin=coin, day=day, open_s=open_s, close_s=close_s,
                            result_id=rid, up=tapes[0], dn=tapes[1]))
