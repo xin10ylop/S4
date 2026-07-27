@@ -102,8 +102,9 @@ class Tape:
     __slots__ = ("ts", "ask", "asz", "bid", "bsz",
                  "buy_sh", "buy_cost", "sell_sh", "sell_proc")
 
-    def __init__(self, g: pd.DataFrame):
-        self.ts = g.timestamp_us.to_numpy(np.int64)
+    def __init__(self, g: pd.DataFrame, clock: str = "exchange"):
+        self.ts = (g.local_timestamp_us if clock == "local"
+                   else g.timestamp_us).to_numpy(np.int64)
         self.ask = g.ask_p0.to_numpy(float)
         self.asz = g.ask_s0.to_numpy(float)
         self.bid = g.bid_p0.to_numpy(float)
@@ -137,13 +138,15 @@ def _valid(x: np.ndarray) -> np.ndarray:
     return np.isfinite(x) & (x > 0.0) & (x < 1.0)
 
 
-def load_day(day: str, fam: str) -> Dict[int, Tape]:
+def load_day(day: str, fam: str, clock: str = "exchange") -> Dict[int, Tape]:
     f = f"{REPO_PROC}/{fam}/bookcurves/{day}.parquet"
     if not os.path.exists(f):
         return {}
-    b = pd.read_parquet(f, columns=_BC_COLS)
-    b = b.dropna(subset=["wts"]).sort_values("timestamp_us")
-    return {int(k): Tape(v) for k, v in b.groupby("wts", sort=False)}
+    cols = list(_BC_COLS) + (["local_timestamp_us"] if clock == "local" else [])
+    b = pd.read_parquet(f, columns=cols)
+    tcol = "local_timestamp_us" if clock == "local" else "timestamp_us"
+    b = b.dropna(subset=["wts"]).sort_values(tcol)
+    return {int(k): Tape(v, clock) for k, v in b.groupby("wts", sort=False)}
 
 
 # ==========================================================================
@@ -219,6 +222,22 @@ class P:
     market: bool = False
     unwind_latency_ms: int = 1500   # for the single-leg abort test
     require_both_fresh: bool = True
+    # ---- CONTAMINATION CONTROLS -----------------------------------------
+    # persist_ms: the violation must have been CONTINUOUSLY present for this
+    #   long before we are allowed to act on it.  A crossed cross-market quote
+    #   that lives 40 ms is far more likely to be the vendor publishing the two
+    #   streams out of sync than a real arbitrage.
+    persist_ms: float = 0.0
+    # dn_haircut: cents added to the Down leg's price, at BOTH signal and fill
+    #   time, to price the fact that ask_Down is reconstructed as (1 - bid_Up)
+    #   rather than observed.  Measured error: mean -0.03c, 1% of ticks
+    #   optimistic by >= 0.5c (see M2 doc S2.2).
+    dn_haircut: float = 0.0
+    # clock: "exchange" (timestamp_us) or "local" (local_timestamp_us, i.e. the
+    #   instant the capture host actually held the update).
+    clock: str = "exchange"
+    # fee_rate=None -> use the per-window fee_rate recorded in windows_all.
+    per_window_fee: bool = False
 
 
 def _grid(t0: int, t1: int, tapes: Sequence[Tape], hz: float) -> np.ndarray:
@@ -236,8 +255,10 @@ def _grid(t0: int, t1: int, tapes: Sequence[Tape], hz: float) -> np.ndarray:
 
 def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
                O15: float, O5: float, pub5_us: int,
-               res15: int, res5: int, C: float, p: P) -> Optional[dict]:
+               res15: int, res5: int, C: float, p: P,
+               fee_rate: Optional[float] = None) -> Optional[dict]:
     """One shared-close pair.  Returns a record or None if no signal fired."""
+    fee = p.fee_rate if fee_rate is None else float(fee_rate)
     close_s = wts15 + 900
     wts5 = wts15 + 600
     close_us = close_s * 1_000_000
@@ -269,9 +290,22 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     ask_lo = np.where(ok, A.ask[ja], np.nan)
     bid_hi = np.where(ok, B.bid[jb], np.nan)
     fresh = (aa <= p.max_book_age_s) & (ab <= p.max_book_age_s)
-    gap = bid_hi - ask_lo
+    # the Down leg is reconstructed as (1 - bid_Up); charge the haircut to the
+    # detected gap so a reconstruction error cannot manufacture a signal.
+    gap = bid_hi - ask_lo - p.dn_haircut
     live = ok & _valid(ask_lo) & _valid(bid_hi) & (gap > p.gap_min)
     sig = live & fresh if p.require_both_fresh else live
+    if p.persist_ms > 0 and sig.any():
+        # rs[i] = grid time at which the CURRENT unbroken `live` run began
+        rs = np.empty(len(grid), np.int64)
+        cur = np.iinfo(np.int64).max
+        for i in range(len(grid)):
+            if not live[i]:
+                cur = np.iinfo(np.int64).max
+            elif cur == np.iinfo(np.int64).max:
+                cur = grid[i]
+            rs[i] = cur
+        sig = sig & (grid - rs >= int(p.persist_ms * 1000))
     hit = np.flatnonzero(sig)
     if len(hit) == 0:
         # still record whether an unfiltered violation existed (diagnostic)
@@ -281,7 +315,7 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     k = hit[0]
     t_sig = int(grid[k])
 
-    rec = dict(day=day, wts15=wts15, close_s=close_s, signal=True,
+    rec = dict(day=day, wts15=wts15, close_s=close_s, signal=True, fee_rate=fee,
                t_sig=t_sig, tau_sig=(close_us - t_sig) / 1e6,
                low_is_5=bool(low_is_5), O5=O5, O15=O15, C=C,
                strike_gap=abs(O5 - O15),
@@ -328,8 +362,8 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     #        bid - slack, so the DOWN limit is (1 - bid_sig) + slack.
     slack = p.slack_frac * rec["gap_sig"]
     want = np.array([p.clip_usd / 1.0])     # $1 of collateral per pair share
-    dn_sig = 1.0 - rec["bid_hi_sig"]
-    dn_fil = 1.0 - bid_hi_f
+    dn_sig = 1.0 - rec["bid_hi_sig"] + p.dn_haircut
+    dn_fil = 1.0 - bid_hi_f + p.dn_haircut
     if p.market:
         lim_a, lim_b_dn = INF, INF
     else:
@@ -353,8 +387,28 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
                     INF if p.market else max(0.0, lim_b_dn - dn_fil))
         s, c = walk_cost(B.sell_sh[fb],
                          B.sell_sh[fb] - B.sell_proc[fb],   # cumulative DOWN cost
-                         want, np.array([dn_fil]), bound, p.depth_fraction)
+                         want, np.array([1.0 - bid_hi_f]), bound, p.depth_fraction)
         sh_b, proc_b = float(s[0]), float(c[0])
+        proc_b += p.dn_haircut * sh_b       # reconstruction haircut, per share
+
+    # ---- DEPTH CENSUS at the fill instant, 3c walk bound, size-unbounded ----
+    BIG = np.array([1e9])
+    sda, cda = walk_cost(A.buy_sh[fa], A.buy_cost[fa], BIG,
+                         np.array([ask_lo_f]), 0.03, 1.0)
+    sdb, cdb = walk_cost(B.sell_sh[fb], B.sell_sh[fb] - B.sell_proc[fb], BIG,
+                         np.array([1.0 - bid_hi_f]), 0.03, 1.0)
+    rec.update(depth_a_sh=float(sda[0]), depth_a_usd=float(cda[0]),
+               depth_b_sh=float(sdb[0]), depth_b_usd=float(cdb[0]),
+               depth_pair_sh=float(min(sda[0], sdb[0])),
+               depth_pair_usd=float(min(sda[0], sdb[0])
+                                    * ((cda[0] / sda[0] if sda[0] > 1e-9 else 0.0)
+                                       + (cdb[0] / sdb[0] if sdb[0] > 1e-9 else 0.0))))
+    # top-of-book only (walk bound 0) - the size a strict at-the-quote IOC gets
+    s0a, _ = walk_cost(A.buy_sh[fa], A.buy_cost[fa], BIG,
+                       np.array([ask_lo_f]), 0.0, 1.0)
+    s0b, _ = walk_cost(B.sell_sh[fb], B.sell_sh[fb] - B.sell_proc[fb], BIG,
+                       np.array([1.0 - bid_hi_f]), 0.0, 1.0)
+    rec.update(depth_pair_top_sh=float(min(s0a[0], s0b[0])))
 
     px_a = (cost_a / sh_a) if sh_a > 1e-9 else np.nan
     px_b = (proc_b / sh_b) if sh_b > 1e-9 else np.nan       # avg DOWN price paid
@@ -365,8 +419,8 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
     # ---- (1) the matched portion: a true arbitrage pair -------------------
     pnl_pair = 0.0
     if n_pair > 1e-9:
-        ca = px_a + fee_per_share(px_a, p.fee_rate)
-        cb = px_b + fee_per_share(px_b, p.fee_rate)
+        ca = px_a + fee_per_share(px_a, fee)
+        cb = px_b + fee_per_share(px_b, fee)
         rec.update(cost_per_pair=ca + cb, pnl_per_pair=payoff - (ca + cb),
                    gross_cost_per_pair=px_a + px_b,
                    fee_per_pair=(ca - px_a) + (cb - px_b))
@@ -383,7 +437,7 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
             leg, px, won, tape, long_up = "long_up_low", px_a, up_low_wins, A, True
         else:
             leg, px, won, tape, long_up = "long_dn_high", px_b, dn_high_wins, B, False
-        entry = resid * (px + fee_per_share(px, p.fee_rate))
+        entry = resid * (px + fee_per_share(px, fee))
         rec.update(leg=leg, leg_px=px, leg_won=bool(won), leg_entry=entry)
         pnl_resid_hold = (1.0 if won else 0.0) * resid - entry
         # ABORT: unwind by crossing back at t + latency + unwind_latency
@@ -407,7 +461,7 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
                 got, spent = float(s[0]), float(c[0])
                 exit_px = (1.0 - spent / got) if got > 1e-9 else 0.0
             unsold = resid - got
-            pnl_resid_abort = (got * (exit_px - fee_per_share(exit_px, p.fee_rate))
+            pnl_resid_abort = (got * (exit_px - fee_per_share(exit_px, fee))
                                + (1.0 if won else 0.0) * unsold - entry)
             rec.update(abort_ok=True, abort_px=exit_px,
                        abort_filled_frac=got / resid if resid else 0.0)
@@ -436,7 +490,7 @@ def run_window(day: str, wts15: int, t15: Tape, t5: Tape,
                 opx = spent / got if got > 1e-9 else 0.0
                 o_won = up_low_wins
             if got > 1e-9:
-                paid = got * (opx + fee_per_share(opx, p.fee_rate))
+                paid = got * (opx + fee_per_share(opx, fee))
                 # got shares now form pairs -> payoff; the rest stays naked
                 un = resid - got
                 pnl_resid_complete = (got * payoff - paid
@@ -474,13 +528,15 @@ def run_days(days: Sequence[str], p: P, verbose: bool = True) -> Tuple[pd.DataFr
     w = pd.read_parquet(f"{ROOT}/data/windows_all.parquet")
     w5 = w[w.family == "5m"].set_index("wts")["result_id"].to_dict()
     w15 = w[w.family == "15m"].set_index("wts")["result_id"].to_dict()
+    f5 = w[w.family == "5m"].set_index("wts")["fee_rate"].to_dict()
+    f15 = w[w.family == "15m"].set_index("wts")["fee_rate"].to_dict()
     recs: List[dict] = []
     meta = dict(days=0, pairs=0, no_strike=0, no_book=0, no_result=0,
                 dominance_violations=0)
     for d in days:
         prev = (pd.Timestamp(d) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         cl = load_chainlink([prev, d])
-        T5, T15 = load_day(d, "5m"), load_day(d, "15m")
+        T5, T15 = load_day(d, "5m", p.clock), load_day(d, "15m", p.clock)
         if cl is None or not T5 or not T15:
             if verbose:
                 print(f"  {d}: missing inputs", flush=True)
@@ -507,8 +563,12 @@ def run_days(days: Sequence[str], p: P, verbose: bool = True) -> Tuple[pd.DataFr
             if pd.isna(r5) or pd.isna(r15):
                 meta["no_result"] += 1
                 continue
+            fr = None
+            if p.per_window_fee:
+                a, b = f5.get(wts5), f15.get(wts15)
+                fr = float(max(a if pd.notna(a) else 0.0, b if pd.notna(b) else 0.0))
             rec = run_window(d, wts15, T15[wts15], T5[wts5], O15, O5, pub5,
-                             int(r15), int(r5), C, p)
+                             int(r15), int(r5), C, p, fee_rate=fr)
             pairs += 1
             if rec is not None:
                 recs.append(rec)
