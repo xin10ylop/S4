@@ -23,8 +23,8 @@ from .execution import ExecutionRouter
 from .fill_engine import FillAttempt
 from .ledger import Ledger
 from .logging_setup import get_logger
-from .oracle import BinanceOracle, ChainlinkOracle
-from .polymarket import ClobClientREST, GammaClient, Market, discover_markets
+from .oracle import BinanceOracle, ChainlinkOracle, coin_feed
+from .polymarket import ClobClientREST, GammaClient, Market, OrderBook, discover_markets
 from .risk import CircuitBreaker, WarmupGate
 from .status_server import StatusState, make_server, write_status_loop
 from .strategy import (evaluate_close_snipe, resolve_winner, settle_sweep_target,
@@ -38,7 +38,17 @@ class Engine:
         self.config = config
         self.gamma = GammaClient(config)
         self.clob = ClobClientREST(config)
+        # `self.binance` is BTC/USDT spot: the shipped, validated, only
+        # profitable oracle. It stays a first-class attribute (not just a dict
+        # entry) because everything about bitcoin must keep working byte-for-
+        # byte after the multi-coin refactor.
         self.binance = BinanceOracle(config)
+        # M5: one oracle per NON-bitcoin coin we are allowed to price, built
+        # from the verified `coin -> (symbol, venue)` table in oracle.py. A coin
+        # with no entry here gets NO oracle and therefore never trades; see
+        # `_oracle_for`, which returns None rather than substituting BTC.
+        self.coin_oracles: Dict[str, BinanceOracle] = {}
+        self._build_coin_oracles()
         # The Chainlink oracle is only constructed when a family that resolves
         # on it actually has a strategy enabled. With the shipped config
         # (5m/15m/4h all off) this stays None and the running 1h bot behaves
@@ -89,11 +99,53 @@ class Engine:
         # consecutive empties instead of retrying for the whole window.
         self.settle_empty_streak: Dict[str, int] = {}
         self._snipe_family_warned: Set[str] = set()
+        self._snipe_coin_warned: Set[str] = set()
         self._breaker_blocked_slugs: Set[str] = set()
+        self._shadow_logged: Set[str] = set()
 
         self._stop = threading.Event()
         self._threads: list = []
         self._http_server = None
+
+    # ------------------------------------------------------- per-coin oracles
+    def _priced_coins(self) -> list:
+        """Coins whose underlying we must poll: everything we may fill plus
+        everything we shadow-evaluate. Discovery breadth alone does NOT create
+        an oracle — a discovered-but-unpriced coin simply never produces a
+        signal."""
+        seen, out = set(), []
+        for c in list(self.config.allowed_coins()) + list(self.config.shadow_coins()):
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
+    def _build_coin_oracles(self) -> None:
+        """Construct one BinanceOracle per priced non-bitcoin coin. FAILS CLOSED:
+        a coin missing from oracle.HOURLY_COIN_FEEDS, or whose oracle cannot be
+        constructed, is left with no oracle and can never produce a signal."""
+        for coin in self._priced_coins():
+            if coin == "bitcoin":
+                continue  # served by self.binance
+            feed = coin_feed(coin)
+            if feed is None:
+                log.error("coin %r is configured for pricing but has NO verified feed in "
+                          "oracle.HOURLY_COIN_FEEDS — it will never trade. This is the "
+                          "fail-closed path; add a verified entry or remove the coin.", coin)
+                continue
+            symbol, venue = feed
+            try:
+                self.coin_oracles[coin] = BinanceOracle(self.config, symbol=symbol,
+                                                         venue=venue)
+            except Exception:  # noqa: BLE001
+                log.exception("failed to construct oracle for %s (%s@%s); it will never "
+                              "trade", coin, symbol, venue)
+
+    def _binance_oracles(self) -> Dict[str, BinanceOracle]:
+        """coin -> oracle for every Binance-backed feed the engine polls."""
+        out: Dict[str, BinanceOracle] = {"bitcoin": self.binance}
+        out.update(self.coin_oracles)
+        return out
 
     def _chainlink_needed(self) -> bool:
         """True iff some enabled family declares `oracle: chainlink` AND has a
@@ -127,6 +179,23 @@ class Engine:
         log.info("M4 guard 2 warmup: enabled=%s min_oracle_samples=%d min_uptime_secs=%.0f "
                  "(vol_window=%.0fs)", self.warmup.enabled, self.warmup.min_samples,
                  self.warmup.min_uptime_secs, float(self.config.snipe_cfg["vol_window_secs"]))
+        # M5: the coin wiring is safety-critical, so it is announced explicitly
+        # — which coins are discovered, which may fill, which are shadow-only,
+        # and the exact symbol/venue each one is priced off.
+        log.info("M5 coins: discover=%s allowed(fill)=%s shadow(no fill)=%s",
+                 self.config.hourly_coins(), self.config.allowed_coins(),
+                 self.config.shadow_coins())
+        for coin, oracle in self._binance_oracles().items():
+            log.info("M5 oracle: coin=%-9s symbol=%-9s venue=%-13s cap_usd=%.0f may_fill=%s",
+                     coin, oracle.symbol, oracle.venue, self.config.coin_cap_usd(coin),
+                     coin in self.config.allowed_coins()
+                     and coin not in self.config.shadow_coins())
+        for coin in self._priced_coins():
+            if coin != "bitcoin" and coin not in self.coin_oracles:
+                log.error("M5 oracle MISSING for coin=%s — it is configured for pricing but "
+                          "has no feed; it can never signal. FAIL-CLOSED.", coin)
+        log.info("M5 guard 4 stale-book: max_book_age_s=%s",
+                 self.config.max_book_age_s if self.config.max_book_age_s else "OFF")
         log.info("M4 guard 3 circuit breaker: daily_limit=%s consecutive_loss_brake=%s "
                  "override_path=%s",
                  (f"${self.breaker.daily_limit:.2f}"
@@ -194,21 +263,65 @@ class Engine:
             self.stop()
 
     # --------------------------------------------------------------- oracle
+    def _poll_binance_oracles(self, pool: Optional[ThreadPoolExecutor]) -> None:
+        """Poll every coin oracle for one sample.
+
+        CONCURRENTLY, and this matters more than it looks. M4 §open-item-3
+        measured the single-oracle poll rate at 0.642-0.825 polls/s and flagged
+        that the warmup gate (60 samples in a 120 s window) has only ~22%
+        headroom at the slow end. Polling N coins SEQUENTIALLY would multiply
+        the period by N and deadlock the warmup gate at N >= 2 — the bot would
+        sit "warming up" forever and silently never trade, which M4 identified
+        as a worse failure than the one being guarded. Fanning out keeps the
+        period at ~max(latency) instead of ~sum(latency).
+        """
+        oracles = self._binance_oracles()
+
+        def _one(item):
+            coin, oracle = item
+            try:
+                return coin, oracle.poll_once()
+            except Exception:  # noqa: BLE001 - one bad feed must not stop the others
+                log.exception("oracle poll failed for %s", coin)
+                return coin, None
+
+        if pool is not None and len(oracles) > 1:
+            results = list(pool.map(_one, list(oracles.items())))
+        else:
+            results = [_one(it) for it in oracles.items()]
+        for coin, pt in results:
+            # status.oracle is the BITCOIN price: it is what the shipped
+            # strategy trades and what every existing dashboard/alert reads.
+            if coin == "bitcoin" and pt:
+                self.status.set_oracle(pt.price, pt.ts)
+
     def _oracle_loop(self) -> None:
         last_cl_log = 0.0
-        while not self._stop.is_set():
-            pt = self.binance.poll_once()
-            if pt:
-                self.status.set_oracle(pt.price, pt.ts)
-            if self.chainlink is not None and time.time() - last_cl_log >= 60.0:
-                last_cl_log = time.time()
-                h = self.chainlink.health()
-                log.info("chainlink health: %s", h)
-                if not h["healthy"]:
-                    self.status.add_event("oracle_stale",
-                                          f"chainlink staleness={h['staleness_secs']}s "
-                                          f"reconnects={h['n_reconnects']}")
-            self._stop.wait(1.0)
+        n_oracles = max(1, len(self._binance_oracles()))
+        pool = (ThreadPoolExecutor(max_workers=n_oracles, thread_name_prefix="oracle")
+                if n_oracles > 1 else None)
+        # Rate-COMPENSATING sleep: the old loop slept a flat 1.0 s AFTER the
+        # fetch, so the true period was 1.0 s + latency (the measured
+        # 0.642-0.825 polls/s). Subtracting the elapsed time targets a real 1 Hz
+        # and lifts warmup headroom from ~22% to ~100% at the same threshold.
+        # Floor of 0.2 s so a pathological feed cannot become a hot loop.
+        target = 1.0
+        try:
+            while not self._stop.is_set():
+                t0 = time.time()
+                self._poll_binance_oracles(pool)
+                if self.chainlink is not None and time.time() - last_cl_log >= 60.0:
+                    last_cl_log = time.time()
+                    h = self.chainlink.health()
+                    log.info("chainlink health: %s", h)
+                    if not h["healthy"]:
+                        self.status.add_event("oracle_stale",
+                                              f"chainlink staleness={h['staleness_secs']}s "
+                                              f"reconnects={h['n_reconnects']}")
+                self._stop.wait(max(0.2, target - (time.time() - t0)))
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
 
     # ------------------------------------------------------------ discovery
     def _discovery_loop(self) -> None:
@@ -284,12 +397,26 @@ class Engine:
 
     # ------------------------------------------------- oracle input selection
     def _oracle_for(self, market: Market):
-        """The oracle that actually feeds this family's sigma_1s. Returns None
-        for a chainlink family with no oracle running — WarmupGate then reads
-        0 samples and refuses to trade, which is the safe answer."""
-        if market.family == "1h":
+        """The oracle that actually feeds this market's sigma_1s, or None.
+
+        FAILS CLOSED BY CONSTRUCTION. Returning None means "no trustworthy
+        price for this market"; WarmupGate then reads 0 samples and refuses to
+        trade, and `_snipe_inputs` skips. There is deliberately no default and
+        no fallback branch: a coin priced off another coin's underlying would
+        raise no error, produce confident-looking signals, and lose — the exact
+        silent-catastrophe path M1 §6 item 3 and M3 §13 item 2 both list as
+        blocking for any second coin.
+        """
+        if market.family != "1h":
+            return self.chainlink
+        coin = getattr(market, "coin", None)
+        if coin == "bitcoin":
+            # Read through the attribute, not the map, so `self.binance` stays
+            # the single authoritative BTC oracle.
             return self.binance
-        return self.chainlink
+        if not coin:
+            return None
+        return self.coin_oracles.get(coin)
 
     def _snipe_inputs(self, market: Market, now: float, cfg: dict):
         """(S_open, S_t, sigma_1s) for this family's oracle, or None to skip.
@@ -302,17 +429,24 @@ class Engine:
         the time (audit/A1_chainlink.md §2d).
         """
         if market.family == "1h":
+            # Route strictly by coin. `_oracle_for` returns None for any coin
+            # without a verified feed, and we skip rather than guess.
+            oracle = self._oracle_for(market)
+            if oracle is None:
+                log.warning("no oracle for %s (coin=%r) — refusing to price it",
+                            market.slug, getattr(market, "coin", None))
+                return None
             S_open = self.window_open_cache.get(market.slug)
             if S_open is None:
-                open_px, _ = self.binance.hour_open_close(market.window_start_ts)
+                open_px, _ = oracle.hour_open_close(market.window_start_ts)
                 if open_px is None:
                     return None
                 S_open = open_px
                 self.window_open_cache[market.slug] = S_open
-            latest = self.binance.latest()
+            latest = oracle.latest()
             if latest is None or (now - latest.ts) > 5:
                 return None  # oracle stale, skip this tick rather than trade on old data
-            sigma_1s = self.binance.rolling_log_return_std(float(cfg["vol_window_secs"]))
+            sigma_1s = oracle.rolling_log_return_std(float(cfg["vol_window_secs"]))
             if sigma_1s != sigma_1s or sigma_1s <= 0:  # NaN check
                 return None
             return S_open, latest.price, sigma_1s
@@ -352,6 +486,69 @@ class Engine:
             return None
         return S_open, S_t, sigma_1s
 
+    # ------------------------------------------------------------ book access
+    def _fetch_books(self, token_ids: list) -> Dict[str, OrderBook]:
+        """Fetch several books in ONE round trip, falling back per token.
+
+        Measured live 2026-07-28 (data/multicoin/book_latency.csv): a batched
+        `POST /books` costs the same as a single `GET /book` regardless of how
+        many tokens are asked for (155 ms for 2, 157 ms for 14), while 14
+        sequential GETs cost 2,241 ms — longer than the entire 2.5-5.0 s snipe
+        band. Two sequential GETs (what this used to do) cost ~308 ms; one batch
+        costs ~155 ms, so the margin between the gate and the close grows by
+        ~0.15 s and every additional coin is free.
+
+        Falls back to per-token `GET /book` for anything the batch did not
+        answer, including a total transport failure and a client that has no
+        batch method at all. A missing book must never be silently read as an
+        empty one.
+        """
+        if not token_ids:
+            return {}
+        out: Dict[str, OrderBook] = {}
+        batch = getattr(self.clob, "get_books", None)
+        if callable(batch) and len(token_ids) > 1:
+            try:
+                out = dict(batch(token_ids) or {})
+            except Exception:  # noqa: BLE001 - never let the batch path kill a tick
+                log.exception("batched book fetch raised; falling back to per-token GET")
+                out = {}
+        for tid in token_ids:
+            if out.get(tid) is None:
+                out[tid] = self.clob.get_book(tid)
+        return out
+
+    def _book_too_stale(self, book: Optional[OrderBook],
+                        now: Optional[float] = None) -> Optional[float]:
+        """Book age in seconds if it breaches `max_book_age_s`, else None.
+
+        WHY THIS EXISTS. The shipped backtest ran with no staleness filter at
+        all. The verifier measured what that costs per coin: BTC's worst fill
+        book was 2.2 s old (median 0.30 s) so the guard would never have bound
+        on the only coin that trades — but HYPE drew 93.6% of its P&L from
+        fills against books over 5 s old and BNB 46.5% of its (negative) P&L,
+        and applying a <= 5 s filter lifted the pooled non-BTC result from
+        +2.01c to +3.70c per share. So this is a no-op on what is validated and
+        a real guard on anything new. M1 §3.2 ranks p90 book age BTC 1.9 s /
+        ETH 1.93 s / XRP 4.37 s / DOGE 4.99 s / SOL 6.97 s / BNB 9.14 s /
+        HYPE 87.71 s, which is the same ordering as their measured edge.
+
+        FAILS OPEN on an unmeasurable book (`book_ts is None`), and that choice
+        is deliberate rather than lazy: the age comes from the CLOB's own
+        `timestamp` field, so treating "field absent" as "too stale" would let
+        an upstream schema change silently stop all trading. The absence is
+        logged once per occurrence instead.
+        """
+        limit = self.config.max_book_age_s
+        if limit is None or book is None:
+            return None
+        age = book.age_secs(now)
+        if age is None:
+            log.warning("book %s carries no CLOB timestamp — age guard cannot apply "
+                        "(failing OPEN)", book.token_id)
+            return None
+        return age if age > limit else None
+
     # --------------------------------------------------------- close_snipe
     def _maybe_snipe(self, market: Market, now: float) -> None:
         cfg = self.config.snipe_cfg
@@ -370,6 +567,30 @@ class Engine:
                             "See docs/07_scale_audit.md before adding it.",
                             market.family, market.family, allowed)
             return
+
+        # ---- M5 COIN ALLOWLIST (second, independent of the family allowlist).
+        # `allowed_families` is a FAMILY allowlist; on its own, widening
+        # _HOURLY_RE to seven coins would silently widen what trades (M1 §6
+        # item 4). A coin must be in `allowed_coins` (fills) or `shadow_coins`
+        # (evaluate + log, never fill) to get any further.
+        coin = getattr(market, "coin", None)
+        may_fill = coin in self.config.allowed_coins()
+        is_shadow = coin in self.config.shadow_coins()
+        if not (may_fill or is_shadow):
+            if market.slug not in self._snipe_coin_warned:
+                self._snipe_coin_warned.add(market.slug)
+                log.warning("close_snipe: coin %r (%s) is NOT in "
+                            "strategy.close_snipe.allowed_coins=%s nor shadow_coins=%s — "
+                            "refusing to trade it. See docs/09_multicoin_decision.md.",
+                            coin, market.slug, self.config.allowed_coins(),
+                            self.config.shadow_coins())
+            return
+        # A shadow coin that also happens to be allowed is resolved to SHADOW by
+        # Config.shadow_coins(); re-assert it here so the safe reading is local
+        # and cannot be lost by a future edit to either list.
+        if is_shadow:
+            may_fill = False
+
         tau_lo, tau_hi = snipe_tau_bounds(cfg, int(self.config.execution_cfg["latency_ms"]))
         tau = market.close_ts - now
         # tau_lo is NOT a "too late, give up" case we can log usefully — it is
@@ -409,8 +630,9 @@ class Engine:
             return
         S_open, S_t, sigma_1s = inputs
 
-        book_up = self.clob.get_book(market.up_token_id)
-        book_down = self.clob.get_book(market.down_token_id)
+        books = self._fetch_books([market.up_token_id, market.down_token_id])
+        book_up = books.get(market.up_token_id)
+        book_down = books.get(market.down_token_id)
         # Feed the depth reference from books we already had to fetch — the
         # adverse-size statistic costs no extra REST traffic.
         self.depth.observe_book(market.family, book_up, float(cfg["price_min"]),
@@ -433,10 +655,40 @@ class Engine:
 
         self.snipe_done.add(market.slug)
         signal_id = self.ledger.record_snipe_signal(sig)
-        log.info("SIGNAL close_snipe %s side=%s fair=%.4f ask=%.4f edge=%.4f tau=%.1fs",
-                  market.slug, sig.side, sig.fair, sig.ask, sig.edge, sig.tau_secs)
+        log.info("SIGNAL close_snipe %s coin=%s side=%s fair=%.4f ask=%.4f edge=%.4f tau=%.1fs",
+                  market.slug, coin, sig.side, sig.fair, sig.ask, sig.edge, sig.tau_secs)
         self.status.add_event("signal", f"close_snipe {market.slug} side={sig.side} "
                                          f"edge={sig.edge:.3f}", family=market.family)
+
+        # ---- M5 SHADOW GATE. The signal above is real and is now in the
+        # ledger; what a shadow coin never gets is a fill. Placed AFTER the
+        # signal record on purpose: the whole point of shadow mode is to
+        # accumulate live out-of-sample evidence for a coin whose backtest did
+        # not survive stress (ethereum: +9.94c shipped, +0.49c at a 3 s round
+        # trip, +3.73c at a 300 ms feed lag — verifier §7). Zero risk, real data.
+        if not may_fill:
+            self.status.add_event("shadow_signal",
+                                   f"close_snipe {market.slug} coin={coin} side={sig.side} "
+                                   f"edge={sig.edge:.3f} — SHADOW, no fill dispatched",
+                                   family=market.family)
+            if coin not in self._shadow_logged:
+                self._shadow_logged.add(coin)
+                log.warning("coin %s is in shadow_coins: signals are recorded but NO fill "
+                            "will ever be dispatched for it.", coin)
+            log.info("SHADOW (no fill) %s coin=%s edge=%.4f", market.slug, coin, sig.edge)
+            return
+
+        book_at_signal = book_up if sig.side == "up" else book_down
+
+        # ---- M5 BOOK-AGE GUARD at the decision point. See `_book_too_stale`.
+        stale_age = self._book_too_stale(book_at_signal)
+        if stale_age is not None:
+            log.warning("skipping fill for %s: signal book is %.1fs stale (> %ss)",
+                        market.slug, stale_age, self.config.max_book_age_s)
+            self.status.add_event("stale_book",
+                                   f"close_snipe {market.slug} signal book {stale_age:.1f}s "
+                                   f"stale — no fill", family=market.family)
+            return
 
         if self._would_exceed_global_cap():
             log.warning("skipping fill for %s: max_open_notional would be exceeded", market.slug)
@@ -451,8 +703,10 @@ class Engine:
                                    family=market.family)
             return
 
-        book_at_signal = book_up if sig.side == "up" else book_down
-        cap_usd = float(self.config.sizing_cfg["per_event_cap_usd"])
+        # Per-coin clip. M3 §6: median fillable notional per signal is $6-12 on
+        # EVERY coin including BTC, so the cap is a tail-loss control, not an
+        # upside control — a new coin starts small by construction.
+        cap_usd = self.config.coin_cap_usd(coin)
         latency_ms = int(self.config.execution_cfg["latency_ms"])
         price_min = float(cfg["price_min"])
         price_max = float(cfg["price_max"])
@@ -555,14 +809,33 @@ class Engine:
         Wrapped in a try: status reporting must never be able to stop trading.
         """
         try:
-            wu = self.warmup.check(self.binance,
-                                    float(self.config.snipe_cfg["vol_window_secs"]))
+            window = float(self.config.snipe_cfg["vol_window_secs"])
+            wu = self.warmup.check(self.binance, window)
             # Log warmup progress from the TICK loop, not only from a gated
             # snipe: after a restart the next 1h close can be ~an hour away, and
             # "silently not trading" must never look like "nothing to trade".
             self.warmup.log_progress(wu, "startup")
             wud = wu.as_dict()
             wud["oracle"] = "binance"
+            # Warmup is per-oracle, so it must be REPORTED per-oracle. A shared
+            # poller that starves one coin's buffer is invisible in a single
+            # aggregate number, and "silently not trading" is the failure mode
+            # this whole guard exists to make loud.
+            per_coin = {}
+            for coin, oracle in self._binance_oracles().items():
+                st = self.warmup.check(oracle, window)
+                feed = coin_feed(coin)
+                per_coin[coin] = {
+                    "symbol": feed[0] if feed else None,
+                    "venue": feed[1] if feed else None,
+                    "oracle_samples": st.samples,
+                    "ready": st.ready,
+                    "may_fill": coin in self.config.allowed_coins()
+                                and coin not in self.config.shadow_coins(),
+                    "shadow": coin in self.config.shadow_coins(),
+                    "cap_usd": self.config.coin_cap_usd(coin),
+                }
+            wud["coins"] = per_coin
             risk = self.breaker.evaluate().as_dict()
             if not risk["tripped"] and self._breaker_blocked_slugs:
                 # breaker released (UTC rollover or manual resume): allow the

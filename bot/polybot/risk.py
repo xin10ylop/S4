@@ -208,6 +208,25 @@ def resolve_daily_limit(cfg: dict) -> Optional[float]:
     return min(cands) if cands else None
 
 
+# Second-line defaults for the circuit breaker, mirroring WarmupGate's.
+#
+# Config.risk_cfg already fills these in, so in the shipped bot these constants
+# are shadowed and change nothing. They exist because the verifier's
+# adversarial mutation pass showed the opposite arrangement is unsafe: five
+# mutations that disabled or 10x-loosened the breaker THROUGH Config.risk_cfg
+# survived a green 214-test suite, precisely because CircuitBreaker itself had
+# no defaults of its own to disagree with them and no CircuitBreaker({})
+# assertion (WarmupGate had both, which is why its equivalent mutation died).
+# A guard whose only defaults live in one accessor has one line of defence.
+#
+# They must never be LOOSER than the shipped config.yaml; that is asserted by
+# tests.test_risk_guards.TestBreakerFallbacksAreNeverLooser, which reads the
+# shipped values from config.yaml rather than hardcoding them.
+DEFAULT_BANKROLL_USD = 1250.0
+DEFAULT_MAX_DAILY_LOSS_PCT = 8.0     # -> $100/day at the default bankroll
+DEFAULT_MAX_CONSECUTIVE_LOSSES = 4
+
+
 class CircuitBreaker:
     """Stop opening new positions after a bad day. Read-only w.r.t. the ledger."""
 
@@ -218,9 +237,24 @@ class CircuitBreaker:
         daily = dict(cfg.get("daily_loss_limit") or {})
         streak = dict(cfg.get("consecutive_loss_brake") or {})
         self.daily_enabled = bool(daily.get("enabled", True))
+        # Apply the second-line defaults BEFORE resolving, so a dict that omits
+        # the bankroll/pct pair (or omits the whole block) still yields a real
+        # dollar limit instead of None — None means "the daily leg silently
+        # never fires", which is the failure this defends against.
+        # NOTE the explicit `is None` test rather than dict.setdefault: an
+        # explicit `bankroll_usd: null` in YAML leaves the key PRESENT with a
+        # None value, which setdefault would happily keep and which
+        # resolve_daily_limit would then skip — disabling the daily leg while
+        # `enabled: true` still reads as armed. Only `enabled: false` may turn
+        # this guard off.
+        if daily.get("bankroll_usd") is None:
+            daily["bankroll_usd"] = DEFAULT_BANKROLL_USD
+        if daily.get("max_daily_loss_pct") is None:
+            daily["max_daily_loss_pct"] = DEFAULT_MAX_DAILY_LOSS_PCT
         self.daily_limit = resolve_daily_limit(daily)
         self.streak_enabled = bool(streak.get("enabled", True))
-        self.max_streak = int(streak.get("max_consecutive_losses", 4))
+        self.max_streak = int(streak.get("max_consecutive_losses",
+                                          DEFAULT_MAX_CONSECUTIVE_LOSSES))
         self.override_path = Path(override_path) if override_path else None
         self._lock = threading.Lock()
         self._last_log = 0.0

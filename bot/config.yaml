@@ -14,6 +14,17 @@ endpoints:
   clob_ws: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
   binance_rest_base: "https://data-api.binance.vision"   # portable everywhere (api.binance.com is geo-blocked in some sandboxes)
   binance_ws_base: "wss://stream.binance.com:9443"        # optional, off by default
+  # USD-M FUTURES base. Used by exactly one coin — hype — whose hourly market
+  # resolves on `https://www.binance.com/en/futures/HYPEUSDT`, not on spot
+  # (there is no HYPEUSDT spot pair; data-api.binance.vision returns HTTP 400
+  # "Invalid symbol"). hype is DISABLED, and this endpoint has never been
+  # reached from a machine this project controls: fapi/dapi.binance.com return
+  # HTTP 451 here and the fapi1/fapi2 mirrors redirect to a marketing page.
+  # It exists so that IF hype were ever enabled it would fail loudly on an
+  # unreachable futures endpoint rather than quietly price off a spot pair
+  # that does not exist. Confirm reachability from the production host before
+  # touching it.
+  binance_futures_rest_base: "https://fapi.binance.com"
 
 # TLS: cafile resolved at runtime from POLYBOT_CA_BUNDLE env var if set, else
 # /root/.ccr/ca-bundle.crt if that file exists (dev sandbox), else system default (real server).
@@ -119,12 +130,114 @@ strategy:
     # corrected 5m at +0.87c (t=0.22) at these shipped parameters, i.e. -$58/day at
     # the $250 clip. Do not add one without re-running the go/no-go in docs/07 sec.6.
     allowed_families: ["1h"]
-    snipe_min_tau_secs: 2.5      # was 2.0. The bound must also cover the two blocking
-                                 # /book fetches between the gate and the fill worker
+
+    # ================= M5: WHICH COINS MAY TRADE ============================
+    # The hourly Up/Down family exists for SEVEN coins, all with 24 closes/day
+    # and all resolving on their own Binance <COIN>/USDT 1H candle (audit/
+    # M1_multicoin_recon.md §1-2, independently re-verified 2026-07-28 with a
+    # 7x7 cross-feed confusion matrix: diagonal 100.000%, off-diagonal
+    # 67.6-84.3%, so the feed check has real discriminative power).
+    #
+    # THE EDGE DOES NOT REPLICATE. Backtested over 81 days x 7 coins
+    # (audit/M3_multicoin_backtest.md, reproduced field-for-field by the
+    # verifier), close_snipe at these exact parameters:
+    #     bitcoin  +13.32c/share  66 fills  87.9% win  t_day 3.30   <- the edge
+    #     ethereum  +9.94c        18        88.9%      t_day 1.94
+    #     dogecoin  +1.48c        11        81.8%      t_day -0.09
+    #     bnb       -2.16c        29        72.4%      t_day -0.37
+    #     xrp       -5.93c        15        66.7%      t_day -0.38
+    #     solana    -7.70c        21        57.1%      t_day -0.92
+    #     hype     +25.64c        13       100%        t_day 4.88   <- an artifact
+    #     ---- pooled non-BTC: +2.01c on 107 fills, t_day 0.45,
+    #          bootstrap P(EV<=0)=0.31, TEST half -$2.48/day, and NEGATIVE
+    #          (-2.00c) under a mere +300ms underlying feed lag.
+    #
+    # So: `allowed_coins` is the list of coins that may actually be FILLED, and
+    # it is bitcoin alone. It is enforced in engine._maybe_snipe INDEPENDENTLY
+    # of `allowed_families` above, because widening the slug regex to seven
+    # coins must not by itself widen what trades (M1 §6 item 4).
+    allowed_coins: ["bitcoin"]
+
+    # `shadow_coins` are evaluated against their OWN verified oracle, produce
+    # real signals in the ledger and the log, and can NEVER dispatch a fill
+    # (engine._maybe_snipe returns before the executor).
+    #
+    # ethereum is here rather than in allowed_coins because its backtest does
+    # not survive its own stress grid — a grid M3 never ran for it, and the
+    # verifier did:
+    #     shipped                +9.94c/share   t_day 1.94
+    #     3s round trip          +0.49c         t_day 0.10   <- 95% of the edge
+    #     +300ms feed lag        +3.73c                          gone to ONE
+    #     all stacked            +3.47c                          extra REST hop
+    #     2 Hz decision grid     +6.17c         t_day 1.08   (38% swing on a
+    #                                                         pure implementation
+    #                                                         choice, n=18)
+    # bitcoin over the same grid: +13.32 / +16.01 / +13.11 / +15.38 / +12.69c,
+    # t_day 3.17-3.49 — unmoved. Also: ETH's best single day is 38.6% of its
+    # P&L and its best 3 days are 68.9%; and BTC-ETH daily P&L correlate +0.61,
+    # so the pair's daily sigma is 30.90 vs 26.52 if sized as independent bets.
+    # Shadow mode buys the only thing that could settle this — live
+    # out-of-sample signals — at zero risk. Promote it only on the rule in
+    # docs/09_multicoin_decision.md §6.
+    shadow_coins: ["ethereum"]
+    # NOT LISTED, and why (all measured, none of it aesthetic):
+    #   solana   -7.70c/share, 57.1% win against 99.0% direction accuracy; 24%
+    #            of its signals come from an exactly-ZERO underlying move, where
+    #            a Gaussian fair on a coarse-tick underlying prints fair=0.500
+    #            on no information (M3 §4.4).
+    #   xrp      -5.93c; 18% zero-move signals; worst fill conversion.
+    #   dogecoin +1.48c with a [-32.8, +30.0] CI on 11 fills; best day is 79.8%
+    #            of its P&L; sign flips between halves. $15 liftable depth.
+    #   bnb      THE TRAP. Best coin on TRAIN (+17.2c), worst on TEST (-29.6c,
+    #            -$6.14/day). Its late sign-flip rate is 2.193% vs BTC's 1.044%
+    #            — 2.1x every other coin — because it has the lowest hourly
+    #            volatility, so its close sits near its open and the sign decides
+    #            last. M1's frequency screen ranked it the biggest new
+    #            contributor; it is the most dangerous coin on the list.
+    #   hype     DEFERRED INDEFINITELY, and its +25.64c/t_day 4.88 is an
+    #            artifact, not a result: 13 fills, of which 7 are "two-book"
+    #            fills that saw no new quote at all during the latency window,
+    #            9 are against >5s stale books, and ONE trade is 52.8% of its
+    #            P&L. It also resolves on USD-M FUTURES, has no spot pair, has
+    #            no live feed reachable from anywhere this project has tested,
+    #            $45 median volume/market and ~$2.30 of liftable depth.
+    # Enabling any of them requires re-running the go/no-go in
+    # docs/09_multicoin_decision.md §6 — NOT flipping a list.
+
+    # M5 GUARD 4: STALE-BOOK REJECT. Refuse to lift a book whose CLOB-reported
+    # last-update stamp is older than this. Applied at the decision point AND
+    # inside both the paper and live fill paths.
+    # Calibration: BTC's OLDEST fill book across 66 shipped-parameter fills was
+    # 2.2s (median 0.30s, zero fills over 5s), so at 5.0 this guard would never
+    # have fired on the only coin that trades — it changes nothing validated.
+    # What it does protect: HYPE drew 93.6% of its P&L and BNB 46.5% of its
+    # NEGATIVE P&L from fills against books older than 5s, and applying a <=5s
+    # filter lifts the pooled non-BTC result from +2.01c to +3.70c/share.
+    # M1 §3.2 p90 book age by coin: BTC 1.90s, ETH 1.93s, XRP 4.37s, DOGE
+    # 4.99s, SOL 6.97s, BNB 9.14s, HYPE 87.71s.
+    # FAILS OPEN if the CLOB payload ever stops carrying `timestamp` — an
+    # upstream schema change must not silently halt trading. Logged when it does.
+    max_book_age_s: 5.0
+
+    snipe_min_tau_secs: 2.5      # was 2.0. The bound must also cover the blocking
+                                 # /book fetch(es) between the gate and the fill worker
                                  # (measured delta_book: median 0.315s, cold 0.791s).
                                  # At 2.0 the real fill margin was +0.19s median and
                                  # NEGATIVE on a cold connection — i.e. orders landing
                                  # at/after the close. docs/07_scale_audit.md item 3.
+                                 #
+                                 # STAYS AT 2.5 AFTER THE M5 BATCHING CHANGE, deliberately.
+                                 # The bot now fetches both books in ONE `POST /books`
+                                 # instead of two sequential GETs, which cuts the median
+                                 # book cost from ~308ms to ~155ms (measured 2026-07-28,
+                                 # data/multicoin/book_latency.csv) and so BUYS +0.15s of
+                                 # margin at the SAME tau_lo. Lowering tau_lo to 2.0 to
+                                 # spend that margin on frequency instead does not work:
+                                 # the worst single fetch observed in the same run was
+                                 # 704ms, which at tau_lo=2.0 gives 2.0-0.70-1.5 = -0.2s,
+                                 # i.e. an order arriving AFTER the close on a cold
+                                 # connection — the exact failure 2.5 was introduced to
+                                 # fix. Spend the batching win on robustness, not on tau.
     snipe_fill_margin_secs: 0.5  # NEW. Required slack between order arrival and the close.
                                  # tau=1 signals filled 0/46 times (42 hit an empty book);
                                  # in LIVE that is a real order sent into a closed market.
@@ -243,6 +356,15 @@ sizing:
   # PAPER-only for now: docs/06 sec.8 sets the live go/no-go at ~20 resolved trades and
   # $25-50 to start. Do NOT carry $250 into LIVE on the strength of the backtest alone.
   per_event_cap_usd: 250
+  # Per-coin override of the clip above. Empty today because bitcoin is the only
+  # coin that may fill; the entries are pre-written so that promoting a coin out
+  # of shadow_coins does NOT also silently promote it to the $250 BTC clip.
+  # M3 §6 measured fillable notional per signal at a median of only $6-12 on
+  # EVERY coin (BTC $10.51, ETH $9.00), with the $250 cap binding on 0-6.7% of
+  # fills — so the book, not this number, sets the size, and a 10x clip buys
+  # about 3x P&L while sizing the tail loss 10x. Anything new starts at $25.
+  per_coin_cap_usd:
+    ethereum: 25   # inert while ethereum is shadow-only (it can never fill)
   # `_would_exceed_global_cap` is a "stop opening new positions" gate evaluated BEFORE the
   # new trade is sized (engine.py uses `>=` on current open notional), so the true ceiling
   # is max_open_notional + per_event_cap_usd = $1250. 1h positions resolve within ~1-2 min
@@ -311,6 +433,14 @@ discovery:
   hourly_lookahead_hours: 3    # also probe direct slugs for the next N ET hours
   events_limit: 200
   markets_limit: 1000
+  # Which coins' hourly markets are LOOKED UP. This is a discovery knob, not a
+  # trading permission — what may actually be filled is
+  # strategy.close_snipe.allowed_coins, and what is merely evaluated is
+  # shadow_coins. Each coin costs (hourly_lookahead_hours + 2) = 5 gamma calls
+  # per discovery pass, so listing all seven would be 35 calls every 30s for
+  # five coins that are not permitted to trade and one that cannot be priced.
+  # Keep this equal to allowed_coins + shadow_coins.
+  hourly_coins: ["bitcoin", "ethereum"]
 
 logging:
   level: INFO

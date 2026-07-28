@@ -161,6 +161,23 @@ def walk_asks(
     return result
 
 
+def book_is_stale(book: Optional[OrderBook], max_book_age_s: Optional[float],
+                  now: Optional[float] = None) -> bool:
+    """True iff the CLOB's own last-update stamp for `book` is older than the
+    bound. Shared by the paper and live order paths so they cannot diverge.
+
+    Fails OPEN (returns False) when the guard is off, the book is missing, or
+    the payload carried no timestamp — an upstream schema change must not
+    silently halt all trading. See engine._book_too_stale for the full argument.
+    """
+    if book is None or max_book_age_s is None or max_book_age_s <= 0:
+        return False
+    age = book.age_secs(now)
+    if age is None:
+        return False
+    return age > float(max_book_age_s)
+
+
 @dataclass
 class FillAttempt:
     """Record of one attempt to fill a signal — successful or not.
@@ -179,6 +196,8 @@ class FillAttempt:
     edge_min: float
     # "filled" | "no_book" | "empty_book" | "book_moved_no_edge"
     # | "adverse_size_blocked" (M4 guard 1 declined every profitable level)
+    # | "stale_book"           (M5 guard: the CLOB had not updated this book
+    #                           within max_book_age_s, so we refuse to lift it)
     outcome: str
 
     @property
@@ -202,6 +221,7 @@ def execute_taker_signal(
     max_above_best: Optional[float] = 0.03,
     max_level_shares: Optional[float] = None,
     anomalous_mode: str = "cap",
+    max_book_age_s: Optional[float] = None,
 ) -> FillAttempt:
     """Simulate the full signal -> latency -> re-fetch -> fill pipeline for one attempt.
 
@@ -209,6 +229,12 @@ def execute_taker_signal(
     called from a worker thread so the main loop is not blocked. Tests may
     pass sleep=False to skip the wait (book_at_fill would then equal a
     fresh fetch taken immediately).
+
+    `max_book_age_s` (M5) rejects a FILL-TIME book the CLOB has not updated
+    recently. This is the position the measurement actually indicts: the
+    verifier found HYPE drew 93.6% of its P&L and BNB 46.5% of its negative
+    P&L from fills against books older than 5 s, while BTC's oldest fill book
+    in 66 fills was 2.2 s. None disables it.
     """
     signal_time = time.time()
     if sleep and latency_ms > 0:
@@ -227,6 +253,15 @@ def execute_taker_signal(
             token_id=token_id, side=side, signal_time=signal_time, fill_time=fill_time,
             latency_ms=latency_ms, book_at_signal=book_at_signal, book_at_fill=book,
             walk=WalkResult(), edge_min=edge_min, outcome="empty_book",
+        )
+    if book_is_stale(book, max_book_age_s, fill_time):
+        log.warning("stale-book guard: refusing to fill %s against a book %.1fs old "
+                    "(max_book_age_s=%s)", token_id, book.age_secs(fill_time),
+                    max_book_age_s)
+        return FillAttempt(
+            token_id=token_id, side=side, signal_time=signal_time, fill_time=fill_time,
+            latency_ms=latency_ms, book_at_signal=book_at_signal, book_at_fill=book,
+            walk=WalkResult(), edge_min=edge_min, outcome="stale_book",
         )
     walk = walk_asks(book.asks, edge_fn, edge_min, price_min, price_max, cap_usd, fee_rate,
                      max_above_best=max_above_best, max_level_shares=max_level_shares,

@@ -649,7 +649,8 @@ class TestStrategyResolveWinner(unittest.TestCase):
         import datetime as dt
         from polybot.polymarket import Market
         return Market(
-            slug=f"btc-updown-{family}-{start}", family=family, question="", condition_id="",
+            slug=f"btc-updown-{family}-{start}", family=family, coin="bitcoin", question="",
+            condition_id="",
             up_token_id="U", down_token_id="D",
             start_date=dt.datetime.fromtimestamp(start, tz=dt.timezone.utc),
             end_date=dt.datetime.fromtimestamp(close, tz=dt.timezone.utc),
@@ -718,7 +719,8 @@ class TestEngineSnipeInputs(unittest.TestCase):
         import datetime as dt
         from polybot.polymarket import Market
         return Market(
-            slug=f"btc-updown-{family}-{start}", family=family, question="", condition_id="",
+            slug=f"btc-updown-{family}-{start}", family=family, coin="bitcoin", question="",
+            condition_id="",
             up_token_id="U", down_token_id="D",
             start_date=dt.datetime.fromtimestamp(start, tz=dt.timezone.utc),
             end_date=dt.datetime.fromtimestamp(close, tz=dt.timezone.utc),

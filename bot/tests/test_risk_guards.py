@@ -11,6 +11,7 @@ audit/M4_risk_guards.md §5.
 """
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import tempfile
@@ -380,6 +381,34 @@ class TestWarmupGate(unittest.TestCase):
         self.assertTrue(bare.enabled)
         self.assertGreaterEqual(bare.min_samples, float(shipped["min_oracle_samples"]))
         self.assertGreaterEqual(bare.min_uptime_secs, float(shipped["min_uptime_secs"]))
+
+    def test_uptime_boundary_is_enforced_just_below_the_minimum(self):
+        """Closes adversarial mutation A8 (verifier §M4).
+
+        The only pre-existing uptime test used uptime=50s against a 120s
+        minimum, so HALVING the threshold in code (`uptime < min/2.0`, i.e.
+        120s -> 60s effective) left the whole 214-test suite green. Anything
+        above 50s still blocked, so the undetected weakening window ran from
+        120s down to ~51s — a 2.4x silent loosening of a shipped guard.
+        Pinning the boundary at exactly (min_uptime_secs - 1) removes it.
+        """
+        gate = WarmupGate({"enabled": True, "min_oracle_samples": 60,
+                           "min_uptime_secs": 120}, started_at=0.0)
+        just_under = gate.check(_WarmOracle(500), 120.0, now=119.0)
+        self.assertFalse(just_under.ready)
+        self.assertEqual(just_under.reason, "insufficient_uptime")
+        just_over = gate.check(_WarmOracle(500), 120.0, now=120.0)
+        self.assertTrue(just_over.ready)
+
+
+class _WarmOracle:
+    """An oracle whose buffer is always full, so only the uptime leg can fail."""
+
+    def __init__(self, n: int):
+        self._n = n
+
+    def n_samples(self, window_secs=120.0):
+        return self._n
 
 
 class TestOracleSampleCount(unittest.TestCase):
@@ -952,6 +981,104 @@ class TestNoExistingGuardWeakened(unittest.TestCase):
         for fam in ("5m", "15m", "4h"):
             self.assertFalse(self.raw["families"][fam]["close_snipe"])
             self.assertFalse(self.raw["families"][fam]["settle_sweep"])
+
+
+# ===========================================================================
+# Backward compatibility of the BREAKER defaults
+#
+# The verifier wrote 36 adversarial mutations against this suite; 8 survived a
+# green 214-test run, and FIVE of them were in Config.risk_cfg:
+#     daily_loss_limit.enabled       True -> False   (breaker off)
+#     consecutive_loss_brake.enabled True -> False   (brake off)
+#     max_daily_loss_pct              8.0 -> 80.0    (10x looser)
+#     max_consecutive_losses            4 -> 40      (10x looser)
+#     bankroll_usd                   1250 -> 12500   (10x looser limit)
+# Each silently hands a pre-M4 config.yaml a disabled or 10x-looser circuit
+# breaker — exactly the case audit/M4_risk_guards.md §4 promises is safe. The
+# existing lock (test_code_fallback_is_never_looser_than_the_shipped_config)
+# only reads warmup_cfg, and WarmupGate({}) had a defaults assertion while
+# CircuitBreaker({}) had none, which is precisely why the warmup mutations were
+# killed and the breaker ones were not.
+#
+# The two tests below are the missing mirrors. They read the SHIPPED values out
+# of config.yaml rather than hardcoding numbers, so they cannot drift.
+# ===========================================================================
+
+class TestBreakerFallbacksAreNeverLooser(unittest.TestCase):
+    def setUp(self):
+        with open(CONFIG_YAML) as f:
+            self.raw = yaml.safe_load(f)
+        self.shipped = Config(raw=self.raw, path=CONFIG_YAML).risk_cfg
+
+    def _without_risk_block(self):
+        raw = copy.deepcopy(self.raw)
+        raw.pop("risk", None)
+        return Config(raw=raw, path=CONFIG_YAML).risk_cfg
+
+    def test_popping_the_whole_risk_block_yields_no_looser_a_breaker(self):
+        fb = self._without_risk_block()
+        ship_daily, fb_daily = self.shipped["daily_loss_limit"], fb["daily_loss_limit"]
+        ship_streak, fb_streak = (self.shipped["consecutive_loss_brake"],
+                                  fb["consecutive_loss_brake"])
+        # Both legs must still be ON.
+        self.assertTrue(fb_daily["enabled"], "daily loss limit defaults OFF")
+        self.assertTrue(fb_streak["enabled"], "consecutive-loss brake defaults OFF")
+        self.assertTrue(ship_daily["enabled"])
+        self.assertTrue(ship_streak["enabled"])
+        # And the resolved DOLLAR limit must be no larger than the shipped one.
+        self.assertLessEqual(
+            resolve_daily_limit(fb_daily), resolve_daily_limit(ship_daily),
+            f"fallback daily limit ${resolve_daily_limit(fb_daily):.2f} is looser "
+            f"than the shipped ${resolve_daily_limit(ship_daily):.2f}")
+        self.assertLessEqual(
+            int(fb_streak["max_consecutive_losses"]),
+            int(ship_streak["max_consecutive_losses"]),
+            "fallback consecutive-loss brake is looser than the shipped one")
+
+    def test_popping_each_sub_key_individually_is_also_no_looser(self):
+        """A partially-migrated config (the `risk:` block exists but a single
+        key was never added) must be safe too, not just a wholly absent one."""
+        ship_limit = resolve_daily_limit(self.shipped["daily_loss_limit"])
+        for block, key in (("daily_loss_limit", "enabled"),
+                            ("daily_loss_limit", "bankroll_usd"),
+                            ("daily_loss_limit", "max_daily_loss_pct"),
+                            ("consecutive_loss_brake", "enabled"),
+                            ("consecutive_loss_brake", "max_consecutive_losses")):
+            raw = copy.deepcopy(self.raw)
+            raw["risk"][block].pop(key, None)
+            cfg = Config(raw=raw, path=CONFIG_YAML).risk_cfg
+            with self.subTest(block=block, key=key):
+                self.assertTrue(cfg["daily_loss_limit"]["enabled"])
+                self.assertTrue(cfg["consecutive_loss_brake"]["enabled"])
+                self.assertLessEqual(
+                    resolve_daily_limit(cfg["daily_loss_limit"]), ship_limit)
+                self.assertLessEqual(
+                    int(cfg["consecutive_loss_brake"]["max_consecutive_losses"]),
+                    int(self.shipped["consecutive_loss_brake"]["max_consecutive_losses"]))
+
+    def test_bare_circuit_breaker_constructor_defaults_are_armed(self):
+        """The CircuitBreaker({}) mirror of the existing WarmupGate({}) check.
+        Its absence is why five config-default mutations went undetected."""
+        with open(CONFIG_YAML) as f:
+            shipped = Config(raw=yaml.safe_load(f), path=CONFIG_YAML).risk_cfg
+        bare = CircuitBreaker({}, _BreakerLedger())
+        self.assertTrue(bare.daily_enabled, "CircuitBreaker({}) has the daily limit OFF")
+        self.assertTrue(bare.streak_enabled, "CircuitBreaker({}) has the streak brake OFF")
+        self.assertIsNotNone(bare.daily_limit,
+                             "CircuitBreaker({}) resolves NO daily limit at all")
+        self.assertLessEqual(bare.daily_limit,
+                             resolve_daily_limit(shipped["daily_loss_limit"]))
+        self.assertLessEqual(bare.max_streak,
+                             int(shipped["consecutive_loss_brake"]
+                                 ["max_consecutive_losses"]))
+        self.assertGreater(bare.max_streak, 0, "a max_streak of 0 disables the brake")
+
+    def test_a_bare_breaker_actually_trips(self):
+        """Defaults being present is not the same as defaults being applied."""
+        bare = CircuitBreaker({}, _BreakerLedger(pnl=-100_000.0))
+        self.assertTrue(bare.evaluate().tripped)
+        bare2 = CircuitBreaker({}, _BreakerLedger(streak=99))
+        self.assertTrue(bare2.evaluate().tripped)
 
 
 if __name__ == "__main__":

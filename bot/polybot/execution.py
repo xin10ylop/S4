@@ -70,7 +70,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .config import Config
-from .fill_engine import FillAttempt, WalkResult, execute_taker_signal, walk_asks
+from .fill_engine import (FillAttempt, WalkResult, book_is_stale, execute_taker_signal,
+                          walk_asks)
 from .logging_setup import get_logger
 from .polymarket import ClobClientREST
 
@@ -112,22 +113,25 @@ class ExecutionRouter:
         a fresh book walk. See module docstring for verification status.
 
         `max_level_shares`/`anomalous_mode` are the adverse-size filter (M4
-        guard 1) and are threaded into BOTH paths on purpose — a risk guard
-        that only exists in the simulator is not a risk guard.
+        guard 1) and `max_book_age_s` is the M5 stale-book guard. All three are
+        threaded into BOTH paths on purpose — a risk guard that only exists in
+        the simulator is not a risk guard.
         """
         max_above_best = self.config.execution_cfg.get("max_walk_above_best", 0.03)
         if max_above_best is not None:
             max_above_best = float(max_above_best)
+        max_book_age_s = self.config.max_book_age_s
         if self.is_live():
             return self._place_live_order(token_id, side, edge_fn, edge_min, price_min,
                                            price_max, cap_usd, max_above_best,
                                            max_level_shares=max_level_shares,
-                                           anomalous_mode=anomalous_mode)
+                                           anomalous_mode=anomalous_mode,
+                                           max_book_age_s=max_book_age_s)
         return execute_taker_signal(
             self.clob_rest, token_id, side, edge_fn, edge_min, price_min, price_max, cap_usd,
             self.config.fee_rate, latency_ms, book_at_signal=book_at_signal, sleep=True,
             max_above_best=max_above_best, max_level_shares=max_level_shares,
-            anomalous_mode=anomalous_mode,
+            anomalous_mode=anomalous_mode, max_book_age_s=max_book_age_s,
         )
 
     def _get_live_client(self):
@@ -186,6 +190,7 @@ class ExecutionRouter:
         max_above_best: Optional[float] = 0.03,
         max_level_shares: Optional[float] = None,
         anomalous_mode: str = "cap",
+        max_book_age_s: Optional[float] = None,
     ) -> FillAttempt:
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
@@ -204,6 +209,15 @@ class ExecutionRouter:
                                 fill_time=time.time(), latency_ms=0, book_at_signal=book,
                                 book_at_fill=book, walk=WalkResult(), edge_min=edge_min,
                                 outcome="empty_book")
+        # M5 stale-book guard, in the LIVE path too: this is where a stale quote
+        # becomes a real order against a counterparty who has already moved.
+        if book_is_stale(book, max_book_age_s):
+            log.warning("LIVE ORDER SUPPRESSED token=%s: book is %.1fs stale "
+                        "(max_book_age_s=%s)", token_id, book.age_secs(), max_book_age_s)
+            return FillAttempt(token_id=token_id, side=side, signal_time=signal_time,
+                                fill_time=time.time(), latency_ms=0, book_at_signal=book,
+                                book_at_fill=book, walk=WalkResult(), edge_min=edge_min,
+                                outcome="stale_book")
 
         # Size/price the same way paper does: walk the live ask ladder for all
         # profitable depth up to cap_usd. A live CLOB order takes one

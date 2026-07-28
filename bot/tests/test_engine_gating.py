@@ -30,6 +30,10 @@ CONFIG_YAML = Path(__file__).resolve().parent.parent / "config.yaml"
 class FakeMarket:
     slug: str = "bitcoin-up-or-down-july-15-2026-3pm-et"
     family: str = "1h"
+    # M5: every Market carries its coin, and the engine routes the oracle and
+    # the fill permission off it. Default bitcoin so these pre-M5 tests keep
+    # testing what they were written to test.
+    coin: str = "bitcoin"
     up_token_id: str = "UP"
     down_token_id: str = "DOWN"
     close_ts: float = 1_000_000.0

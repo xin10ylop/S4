@@ -151,6 +151,152 @@ MUTATIONS = [
      "polybot/status_server.py",
      "            \"guards\": {",
      "            \"_guards\": {"),
+
+    # -----------------------------------------------------------------------
+    # The 8 mutations the independent verifier wrote that SURVIVED a green
+    # 214-test suite (verifier §M4). Five were in Config.risk_cfg, two in
+    # risk.py's shadowed breaker defaults, one in the warmup uptime threshold.
+    # Each silently disables or loosens a shipped guard for exactly the
+    # pre-M4 config.yaml that audit/M4_risk_guards.md §4 promises is safe.
+    # -----------------------------------------------------------------------
+    ("V1 risk_cfg default: daily loss limit OFF for a pre-M4 config",
+     "polybot/config.py",
+     "        daily.setdefault(\"enabled\", True)",
+     "        daily.setdefault(\"enabled\", False)"),
+
+    ("V2 risk_cfg default: consecutive-loss brake OFF for a pre-M4 config",
+     "polybot/config.py",
+     "        streak.setdefault(\"enabled\", True)",
+     "        streak.setdefault(\"enabled\", False)"),
+
+    ("V3 risk_cfg default: daily loss pct 10x looser",
+     "polybot/config.py",
+     "        daily.setdefault(\"max_daily_loss_pct\", 8.0)",
+     "        daily.setdefault(\"max_daily_loss_pct\", 80.0)"),
+
+    ("V4 risk_cfg default: consecutive-loss brake 10x looser",
+     "polybot/config.py",
+     "        streak.setdefault(\"max_consecutive_losses\", 4)",
+     "        streak.setdefault(\"max_consecutive_losses\", 40)"),
+
+    ("V5 risk_cfg default: bankroll 10x, so the daily $ limit is 10x",
+     "polybot/config.py",
+     "        daily.setdefault(\"bankroll_usd\", 1250)",
+     "        daily.setdefault(\"bankroll_usd\", 12500)"),
+
+    ("V6 CircuitBreaker constructor default: daily limit OFF",
+     "polybot/risk.py",
+     "        self.daily_enabled = bool(daily.get(\"enabled\", True))",
+     "        self.daily_enabled = bool(daily.get(\"enabled\", False))"),
+
+    ("V7 CircuitBreaker constructor default: streak brake OFF",
+     "polybot/risk.py",
+     "        self.streak_enabled = bool(streak.get(\"enabled\", True))",
+     "        self.streak_enabled = bool(streak.get(\"enabled\", False))"),
+
+    ("V8 warmup uptime threshold silently HALVED (120s -> 60s effective)",
+     "polybot/risk.py",
+     "        if uptime < self.min_uptime_secs:",
+     "        if uptime < self.min_uptime_secs / 2.0:"),
+
+    # Second-line breaker defaults added in M5 in response to V6/V7.
+    ("V9 CircuitBreaker second-line bankroll default removed",
+     "polybot/risk.py",
+     "            daily[\"bankroll_usd\"] = DEFAULT_BANKROLL_USD",
+     "            daily[\"bankroll_usd\"] = None"),
+
+    ("V10 CircuitBreaker second-line streak default 10x looser",
+     "polybot/risk.py",
+     "                                          DEFAULT_MAX_CONSECUTIVE_LOSSES))",
+     "                                          10 * DEFAULT_MAX_CONSECUTIVE_LOSSES))"),
+
+    # -----------------------------------------------------------------------
+    # M5 multi-coin guards.
+    # -----------------------------------------------------------------------
+    ("M5 coin allowlist deleted (any discovered coin may fill)",
+     "polybot/engine.py",
+     "        if not (may_fill or is_shadow):",
+     "        if False:"),
+
+    ("M5 coin allowlist widened to every coin",
+     "polybot/config.py",
+     "        coins = self.snipe_cfg.get(\"allowed_coins\")\n        if not coins:\n            return [\"bitcoin\"]",
+     "        coins = self.snipe_cfg.get(\"allowed_coins\")\n        if True:\n            return [\"bitcoin\", \"ethereum\", \"solana\", \"xrp\", \"dogecoin\", \"bnb\", \"hype\"]"),
+
+    ("M5 shadow gate removed (shadow coins can fill)",
+     "polybot/engine.py",
+     "        if not may_fill:\n            self.status.add_event(\"shadow_signal\",",
+     "        if False:\n            self.status.add_event(\"shadow_signal\","),
+
+    ("M5 shadow list ignored, so a shadow coin reads as fillable",
+     "polybot/engine.py",
+     "        if is_shadow:\n            may_fill = False",
+     "        if False:\n            may_fill = False"),
+
+    ("M5 oracle routing falls back to BTC for an unknown coin",
+     "polybot/engine.py",
+     "        if not coin:\n            return None\n        return self.coin_oracles.get(coin)",
+     "        if not coin:\n            return self.binance\n        return self.coin_oracles.get(coin, self.binance)"),
+
+    ("M5 _snipe_inputs ignores a missing oracle and uses self.binance",
+     "polybot/engine.py",
+     "            oracle = self._oracle_for(market)\n            if oracle is None:",
+     "            oracle = self._oracle_for(market) or self.binance\n            if oracle is None:"),
+
+    ("M5 HYPE silently rewired from futures to spot",
+     "polybot/oracle.py",
+     "    \"hype\":     (\"HYPEUSDT\", _USDM_FUTURES),",
+     "    \"hype\":     (\"HYPEUSDT\", _SPOT),"),
+
+    ("M5 every coin priced off BTCUSDT",
+     "polybot/oracle.py",
+     "    \"ethereum\": (\"ETHUSDT\",  _SPOT),",
+     "    \"ethereum\": (\"BTCUSDT\",  _SPOT),"),
+
+    ("M5 futures venue silently uses the spot base URL",
+     "polybot/oracle.py",
+     "        self._base = (config.binance_rest_base if venue == _SPOT\n                      else config.binance_futures_rest_base)",
+     "        self._base = config.binance_rest_base"),
+
+    ("M5 stale-book guard removed from the fill path",
+     "polybot/fill_engine.py",
+     "    if book_is_stale(book, max_book_age_s, fill_time):",
+     "    if False:"),
+
+    ("M5 stale-book guard removed from the LIVE order path",
+     "polybot/execution.py",
+     "        if book_is_stale(book, max_book_age_s):",
+     "        if False:"),
+
+    ("M5 stale-book predicate always says fresh",
+     "polybot/fill_engine.py",
+     "    return age > float(max_book_age_s)",
+     "    return False"),
+
+    ("M5 stale-book guard removed from the decision point",
+     "polybot/engine.py",
+     "        stale_age = self._book_too_stale(book_at_signal)\n        if stale_age is not None:",
+     "        stale_age = self._book_too_stale(book_at_signal)\n        if False:"),
+
+    ("M5 config default: max_book_age_s ignored entirely",
+     "polybot/config.py",
+     "        v = self.snipe_cfg.get(\"max_book_age_s\")",
+     "        v = None; self.snipe_cfg.get(\"max_book_age_s\")"),
+
+    ("M5 batch fetch swallows missing tokens as empty books",
+     "polybot/engine.py",
+     "        for tid in token_ids:\n            if out.get(tid) is None:\n                out[tid] = self.clob.get_book(tid)",
+     "        pass"),
+
+    ("M5 per-coin cap ignored, every coin gets the BTC clip",
+     "polybot/config.py",
+     "        if coin in per_coin:\n            return float(per_coin[coin])",
+     "        if False:\n            return float(per_coin[coin])"),
+
+    ("M5 one dead feed aborts the whole oracle poll cycle",
+     "polybot/engine.py",
+     "            except Exception:  # noqa: BLE001 - one bad feed must not stop the others\n                log.exception(\"oracle poll failed for %s\", coin)\n                return coin, None",
+     "            except Exception:  # noqa: BLE001\n                raise"),
 ]
 
 

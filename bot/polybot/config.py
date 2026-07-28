@@ -12,6 +12,13 @@ from typing import Any, Dict, Optional
 
 import yaml
 
+# NB: plain stdlib logging, not .logging_setup — that module imports Config, so
+# using it here would be a circular import. Config is loaded before logging is
+# configured anyway, so these lines go to the root handler.
+import logging
+
+log = logging.getLogger("polybot.config")
+
 BOT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = BOT_ROOT.parent
 DEFAULT_CONFIG_PATH = BOT_ROOT / "config.yaml"
@@ -76,6 +83,15 @@ class Config:
         return self.raw["endpoints"]["binance_ws_base"]
 
     @property
+    def binance_futures_rest_base(self) -> str:
+        """USD-M futures REST base. Only HYPE resolves on futures, and HYPE is
+        disabled, so this is unused today — but it must not silently default to
+        the spot base, because that would give HYPE a wrong-feed price instead
+        of no price. Confirmed unreachable from this sandbox (HTTP 451)."""
+        return self.raw["endpoints"].get("binance_futures_rest_base",
+                                          "https://fapi.binance.com")
+
+    @property
     def fee_rate(self) -> float:
         return float(self.raw["fees"]["fee_rate"])
 
@@ -113,6 +129,85 @@ class Config:
     @property
     def snipe_cfg(self) -> Dict[str, Any]:
         return self.raw["strategy"]["close_snipe"]
+
+    # --- multi-coin (M5) ------------------------------------------------------
+    # Three INDEPENDENT lists, deliberately not one. Collapsing them is how a
+    # recon result ("this coin exists") turns into a trade ("this coin is
+    # profitable") without anyone deciding it should.
+    #
+    #   discovery.hourly_coins            -> which coins we even look up
+    #   strategy.close_snipe.shadow_coins -> evaluated + logged, can NEVER fill
+    #   strategy.close_snipe.allowed_coins-> the only coins that may be filled
+    #
+    # Every one of them defaults to bitcoin-only when the key is absent, so a
+    # pre-M5 config.yaml keeps exactly today's behaviour.
+    def hourly_coins(self) -> list:
+        """Coins whose hourly markets are DISCOVERED. Never a trading permission."""
+        coins = self.discovery_cfg.get("hourly_coins")
+        if not coins:
+            return ["bitcoin"]
+        return [str(c) for c in coins]
+
+    def allowed_coins(self) -> list:
+        """Coins that may actually be FILLED. Defaults to bitcoin alone.
+
+        M1 §7 item 4 / M3 §12 item 1: widening the slug regex must not by itself
+        widen what trades. Five of the six non-BTC coins measured at or below
+        zero, so an implicit allowlist is a direct route to -$1.81/day (BNB).
+        """
+        coins = self.snipe_cfg.get("allowed_coins")
+        if not coins:
+            return ["bitcoin"]
+        return [str(c) for c in coins]
+
+    def shadow_coins(self) -> list:
+        """Coins evaluated and logged but structurally unable to fill.
+
+        A coin listed here (and not in allowed_coins) produces real signals in
+        the ledger and the log, priced off its OWN verified oracle, but the fill
+        dispatch is skipped. This is how out-of-sample live evidence gets
+        collected for a coin whose backtest did not survive stress, at zero
+        risk. Defaults to empty.
+        """
+        coins = self.snipe_cfg.get("shadow_coins") or []
+        allowed = set(self.allowed_coins())
+        # A coin in BOTH lists is a config contradiction. Resolve it the safe
+        # way: shadow wins, i.e. it does not trade. Loudly, at load time.
+        out = []
+        for c in coins:
+            c = str(c)
+            if c in allowed:
+                log.warning("coin %r appears in BOTH allowed_coins and shadow_coins; "
+                            "treating it as SHADOW (no fills). Remove it from one list.", c)
+            out.append(c)
+        return out
+
+    def coin_cap_usd(self, coin: str) -> float:
+        """Per-event clip for a coin. `sizing.per_coin_cap_usd` overrides the
+        shared `sizing.per_event_cap_usd`.
+
+        M3 §6: every coin including BTC offers a median of only $6-12 of
+        fillable notional per signal, so a big cap buys little upside and sizes
+        the tail loss. Any new coin starts small on purpose.
+        """
+        per_coin = (self.sizing_cfg.get("per_coin_cap_usd") or {})
+        if coin in per_coin:
+            return float(per_coin[coin])
+        return float(self.sizing_cfg["per_event_cap_usd"])
+
+    @property
+    def max_book_age_s(self) -> Optional[float]:
+        """`strategy.close_snipe.max_book_age_s` — refuse to act on a book the
+        CLOB last updated more than this many seconds ago. None/absent = off."""
+        v = self.snipe_cfg.get("max_book_age_s")
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            log.warning("bad max_book_age_s %r — treating the guard as OFF", v)
+            return None
+        return f if f > 0 else None
 
     @property
     def settle_cfg(self) -> Dict[str, Any]:

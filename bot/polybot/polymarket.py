@@ -16,9 +16,20 @@ log = get_logger("polymarket")
 
 ET = ZoneInfo("America/New_York")
 
+# Every coin that has an hourly Up/Down family on Polymarket. Enumerated
+# exhaustively in audit/M1_multicoin_recon.md §1.1 (43 other candidates probed,
+# none exist) and re-verified live 2026-07-28. Recognising a slug here is NOT
+# permission to trade it — that is `strategy.close_snipe.allowed_coins`, which
+# defaults to ["bitcoin"] (engine._maybe_snipe).
+HOURLY_COINS = ("bitcoin", "ethereum", "solana", "xrp", "dogecoin", "bnb", "hype")
+
 # Slug patterns per family. Hourly requires an explicit hour+am/pm suffix so we
 # don't accidentally match unrelated "bitcoin-up-or-down-on-<date>" daily markets.
-_HOURLY_RE = re.compile(r"^bitcoin-up-or-down-[a-z]+-\d{1,2}-\d{4}-\d{1,2}(am|pm)-et$")
+# The slug names the hour the candle OPENS, in ET wall clock (M1 §1.1).
+_HOURLY_RE = re.compile(
+    r"^(?P<coin>" + "|".join(HOURLY_COINS) + r")"
+    r"-up-or-down-[a-z]+-\d{1,2}-\d{4}-\d{1,2}(am|pm)-et$"
+)
 _SHORT_RE = re.compile(r"^btc-updown-(5m|15m|4h)-(\d+)$")
 
 _SHORT_DURATION = {"5m": 300, "15m": 900, "4h": 14400}
@@ -29,6 +40,7 @@ _DURATION_SECS = {"1h": 3600, **_SHORT_DURATION}
 class Market:
     slug: str
     family: str                # "1h", "15m", "5m", "4h"
+    coin: str                  # "bitcoin" | "ethereum" | ... (see HOURLY_COINS)
     question: str
     condition_id: str
     up_token_id: str
@@ -54,12 +66,17 @@ class Market:
 
 def _parse_market(m: dict) -> Optional[Market]:
     slug = m.get("slug", "")
-    if _HOURLY_RE.match(slug):
+    hm = _HOURLY_RE.match(slug)
+    if hm:
         family = "1h"
+        coin = hm.group("coin")
     else:
         sm = _SHORT_RE.match(slug)
         if sm:
             family = sm.group(1)
+            # The short families exist for BTC only ("btc-updown-*"); the slug
+            # pattern itself pins the coin, so this is a fact, not a default.
+            coin = "bitcoin"
         else:
             return None
     try:
@@ -91,6 +108,7 @@ def _parse_market(m: dict) -> Optional[Market]:
     return Market(
         slug=slug,
         family=family,
+        coin=coin,
         question=m.get("question", ""),
         condition_id=m.get("conditionId", ""),
         up_token_id=token_ids[0],
@@ -107,13 +125,16 @@ def _parse_market(m: dict) -> Optional[Market]:
     )
 
 
-def _hourly_slug(et_dt: dt.datetime) -> str:
+def _hourly_slug(coin: str, et_dt: dt.datetime) -> str:
+    """Deterministic hourly slug for a coin. Uniform across all seven coins
+    (M1 §1.1, 22,713 markets checked): the ET wall-clock hour named is the one
+    the candle OPENS in."""
     hour12 = et_dt.hour % 12
     if hour12 == 0:
         hour12 = 12
     ampm = "am" if et_dt.hour < 12 else "pm"
     month = et_dt.strftime("%B").lower()
-    return f"bitcoin-up-or-down-{month}-{et_dt.day}-{et_dt.year}-{hour12}{ampm}-et"
+    return f"{coin}-up-or-down-{month}-{et_dt.day}-{et_dt.year}-{hour12}{ampm}-et"
 
 
 class GammaClient:
@@ -219,13 +240,19 @@ def discover_markets(gamma: GammaClient, config: Config) -> Dict[str, Market]:
         lookahead = int(disc_cfg.get("hourly_lookahead_hours", 3))
         et_now = now_utc.astimezone(ET)
         et_hour = et_now.replace(minute=0, second=0, microsecond=0)
-        for i in range(-1, lookahead + 1):
-            slug = _hourly_slug(et_hour + dt.timedelta(hours=i))
-            raw = gamma.get_market_by_slug(slug)
-            if raw:
-                mkt = _parse_market(raw)
-                if mkt:
-                    found[mkt.slug] = mkt
+        # DISCOVERY breadth is a separate knob from TRADING permission. Only
+        # coins listed in `discovery.hourly_coins` are probed (each costs
+        # lookahead+2 gamma calls per discovery pass); whether a discovered
+        # coin may ever be filled is decided later by
+        # `strategy.close_snipe.allowed_coins`. Defaults to bitcoin alone.
+        for coin in config.hourly_coins():
+            for i in range(-1, lookahead + 1):
+                slug = _hourly_slug(coin, et_hour + dt.timedelta(hours=i))
+                raw = gamma.get_market_by_slug(slug)
+                if raw:
+                    mkt = _parse_market(raw)
+                    if mkt:
+                        found[mkt.slug] = mkt
 
     for fam_name, dur in _SHORT_DURATION.items():
         fc = families.get(fam_name)
@@ -285,6 +312,60 @@ class ClobClientREST:
             return None
         return OrderBook.from_raw(token_id, data)
 
+    def get_books(self, token_ids: List[str]) -> Dict[str, "OrderBook"]:
+        """Batch book fetch over `POST /books`. Returns {token_id: OrderBook}.
+
+        This is the change that makes more than one market per close affordable.
+        Measured live 2026-07-28 from this sandbox over 6 trials each
+        (`scripts/multicoin/measure_book_latency.py`, raw timings in
+        `data/multicoin/book_latency.csv`):
+
+            GET  /book   x1  ......  153.9 ms median
+            GET  /book   x14 seq ... 2241.4 ms median   <- longer than the whole
+                                                           2.5-5.0 s snipe band
+            POST /books  x14 ......   157.2 ms median   <- same cost as ONE GET
+            POST /books  x2  ......   155.4 ms median
+
+        So book-fetch cost is essentially independent of how many tokens are
+        asked for, and the two sequential GETs the bot used to do per snipe
+        (~308 ms) collapse to one ~155 ms call. That is the whole reason a
+        second coin is latency-free. (M1 §6.3 measured the same shape on a
+        slower connection — 417 / 5,492 / 344 ms; the verifier could not
+        reproduce it because no artifact was stored. Now one is.)
+
+        Returns {} on transport failure and omits any token the server did not
+        answer for; the caller MUST fall back per-token rather than treat a
+        missing entry as an empty book (engine._fetch_books does).
+        """
+        if not token_ids:
+            return {}
+        try:
+            r = self.session.post(
+                f"{self.base}/books",
+                json=[{"token_id": t} for t in token_ids],
+                timeout=5,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("batch book fetch failed for %d tokens: %s", len(token_ids), exc)
+            return {}
+        if isinstance(data, dict):
+            data = [data]
+        out: Dict[str, OrderBook] = {}
+        for entry in data or []:
+            if not isinstance(entry, dict):
+                continue
+            tid = entry.get("asset_id") or entry.get("token_id")
+            if not tid:
+                continue
+            out[str(tid)] = OrderBook.from_raw(str(tid), entry)
+        missing = [t for t in token_ids if t not in out]
+        if missing:
+            log.warning("batch book fetch returned %d/%d books (missing %d)",
+                        len(out), len(token_ids), len(missing))
+        return out
+
     def get_midpoint(self, token_id: str) -> Optional[float]:
         try:
             r = self.session.get(f"{self.base}/midpoint", params={"token_id": token_id}, timeout=5)
@@ -307,6 +388,21 @@ class OrderBook:
     bids: List[BookLevel]  # sorted descending by price (best bid first)
     asks: List[BookLevel]  # sorted ascending by price (best ask first)
     fetched_at: float
+    # The CLOB's OWN last-update stamp for this book, in unix seconds, or None
+    # when the payload omitted it. Verified live 2026-07-28: `/book` and
+    # `/books` both return `timestamp` (epoch ms, as a string). M1 §3.2
+    # separately established it is a genuine last-update stamp — it never moved
+    # while the book `hash` was unchanged, 0 exceptions in 4,564 polls. This is
+    # what `strategy.close_snipe.max_book_age_s` measures; `fetched_at` (when WE
+    # fetched) is NOT a substitute, it is always ~0 by construction.
+    book_ts: Optional[float] = None
+    # Tick size as reported by the CLOB for this token. M1 §2.2: tick size is
+    # NOT uniform across coins (0.001 for BTC/ETH/SOL/XRP/DOGE, 0.01 for
+    # BNB/HYPE at the same instant) and gamma disagrees with the CLOB, so the
+    # CLOB's own value is the authoritative one. Recorded for observability;
+    # the live order path resolves it independently through py-clob-client
+    # (execution.ExecutionRouter.warm_cache).
+    tick_size: Optional[float] = None
 
     @classmethod
     def from_raw(cls, token_id: str, data: dict) -> "OrderBook":
@@ -319,7 +415,9 @@ class OrderBook:
             (BookLevel(float(l["price"]), float(l["size"])) for l in data.get("asks", [])),
             key=lambda l: l.price,
         )
-        return cls(token_id=token_id, bids=bids, asks=asks, fetched_at=time.time())
+        return cls(token_id=token_id, bids=bids, asks=asks, fetched_at=time.time(),
+                   book_ts=_parse_book_ts(data.get("timestamp")),
+                   tick_size=_parse_float_or_none(data.get("tick_size")))
 
     @property
     def best_ask(self) -> Optional[BookLevel]:
@@ -328,3 +426,42 @@ class OrderBook:
     @property
     def best_bid(self) -> Optional[BookLevel]:
         return self.bids[0] if self.bids else None
+
+    def age_secs(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds since the CLOB last updated this book, or None if unknown.
+
+        None means "cannot measure", NOT "fresh" — every caller must decide
+        explicitly what to do with an unmeasurable book. See
+        engine._book_too_stale, which fails OPEN on None (and says why).
+        """
+        if self.book_ts is None:
+            return None
+        import time
+        return (time.time() if now is None else now) - self.book_ts
+
+
+def _parse_float_or_none(v) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_book_ts(v) -> Optional[float]:
+    """CLOB `timestamp` is epoch MILLISECONDS delivered as a string. Anything
+    that does not parse, or that is not plausibly a millisecond epoch, becomes
+    None rather than a wrong age."""
+    ms = _parse_float_or_none(v)
+    if ms is None or ms <= 0:
+        return None
+    secs = ms / 1000.0
+    # Sanity: reject a value that is not within a few years of now, which is
+    # what a seconds-vs-milliseconds unit change would look like.
+    import time
+    now = time.time()
+    if not (now - 86400.0 * 365 * 5 < secs < now + 86400.0):
+        log.warning("implausible book timestamp %r -> treating age as unknown", v)
+        return None
+    return secs

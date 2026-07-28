@@ -37,26 +37,116 @@ class PricePoint:
     price: float
 
 
-class BinanceOracle:
-    """Maintains a 1-second-ish rolling series of BTC/USDT price via REST polling.
+# ---------------------------------------------------------------------------
+# Per-coin underlying feeds for the hourly Up/Down families
+# ---------------------------------------------------------------------------
+#
+# SAFETY-CRITICAL TABLE. Wiring a market to the wrong underlying is the error
+# class that cost this project 3-for-3 losing fills (config.yaml, settle_sweep
+# autopsy). Nothing here is inferred from a ticker name.
+#
+# Provenance, in order of strength:
+#   1. Each family's OWN `resolutionSource` string, read off gamma. All seven
+#      say `https://www.binance.com/en/trade/<PAIR>` except hype, which says
+#      `https://www.binance.com/en/futures/HYPEUSDT`. Exactly one distinct
+#      source per coin across 22,713 hourly markets back to 2026-03-15; no coin
+#      has ever switched feed. Re-fetched live and matched verbatim by the
+#      independent verifier on 2026-07-28 (M1 §2.1).
+#   2. Independent settle reconciliation: Up/Down re-derived from each coin's
+#      own Binance candle vs the vendor's resolved outcome — 1,915/1,915 =
+#      100.000% for every coin, 13,405 closes (M3 §1.3a, verifier §1).
+#   3. The check has POWER, which is the part that matters: the verifier ran the
+#      7x7 cross-feed confusion matrix nobody else ran. Diagonal 100.000%,
+#      off-diagonal 67.6-84.3%. A coin scored against the WRONG feed does not
+#      reproduce, so 100% agreement is evidence, not a tautology.
+#
+# `venue` selects the REST surface, because HYPE genuinely resolves on a
+# different one: there is no HYPE/USDT SPOT pair at all
+# (data-api.binance.vision returns HTTP 400 "Invalid symbol"), so a spot oracle
+# for HYPE could not even be built by accident.
+_SPOT = "spot"
+_USDM_FUTURES = "usdm_futures"
 
-    Uses data-api.binance.vision, which is reachable from anywhere (unlike
+HOURLY_COIN_FEEDS: Dict[str, Tuple[str, str]] = {
+    "bitcoin":  ("BTCUSDT",  _SPOT),
+    "ethereum": ("ETHUSDT",  _SPOT),
+    "solana":   ("SOLUSDT",  _SPOT),
+    "xrp":      ("XRPUSDT",  _SPOT),
+    "dogecoin": ("DOGEUSDT", _SPOT),
+    "bnb":      ("BNBUSDT",  _SPOT),
+    "hype":     ("HYPEUSDT", _USDM_FUTURES),   # USD-M FUTURES, not spot.
+}
+
+# REST shape per venue. Spot uses data-api.binance.vision (reachable from
+# anywhere; api.binance.com 451s in some sandboxes). USD-M futures has no
+# mirror equivalent and no 1s kline interval.
+_VENUE_REST = {
+    _SPOT: {
+        "path_prefix": "/api/v3",
+        "supports_1s_klines": True,
+    },
+    _USDM_FUTURES: {
+        "path_prefix": "/fapi/v1",
+        # Binance USD-M futures klines start at 1m; there is no `interval=1s`.
+        # `price_at_second` therefore cannot be answered on this venue and
+        # returns None rather than silently substituting a 1m open.
+        "supports_1s_klines": False,
+    },
+}
+
+
+def coin_feed(coin: str) -> Optional[Tuple[str, str]]:
+    """(symbol, venue) for an hourly coin, or None if the coin is unknown.
+
+    None must be treated as "do not price this market" by every caller. Fail
+    closed: an unknown coin priced off some other coin's feed is exactly the
+    silent catastrophe M1 §6 and M3 §13 both flag as blocking.
+    """
+    return HOURLY_COIN_FEEDS.get(coin)
+
+
+class BinanceOracle:
+    """Maintains a 1-second-ish rolling series of <SYMBOL> price via REST polling.
+
+    Spot uses data-api.binance.vision, which is reachable from anywhere (unlike
     api.binance.com, which 451s in some sandboxes). This is a REST poller by
     design (simple, portable, testable here); an optional websocket client can
     be layered on later without changing the public interface.
+
+    One instance per SYMBOL. The engine keeps a `coin -> BinanceOracle` map and
+    routes strictly by `Market.coin`; there is no default and no fallback,
+    because a fallback here means pricing ETH off BTC with no error raised.
     """
 
-    def __init__(self, config: Config, symbol: str = "BTCUSDT", maxlen: int = 3700):
-        self._base = config.binance_rest_base
+    def __init__(self, config: Config, symbol: str = "BTCUSDT", maxlen: int = 3700,
+                 venue: str = _SPOT):
+        if venue not in _VENUE_REST:
+            raise ValueError(f"unknown binance venue {venue!r}")
+        self._venue = venue
+        self._base = (config.binance_rest_base if venue == _SPOT
+                      else config.binance_futures_rest_base)
+        self._prefix = _VENUE_REST[venue]["path_prefix"]
+        self._supports_1s = bool(_VENUE_REST[venue]["supports_1s_klines"])
         self._symbol = symbol
         self._session = get_session()
         self._series: Deque[PricePoint] = collections.deque(maxlen=maxlen)
 
+    @property
+    def symbol(self) -> str:
+        return self._symbol
+
+    @property
+    def venue(self) -> str:
+        return self._venue
+
+    def __repr__(self) -> str:  # shows up in logs and status.json debugging
+        return f"BinanceOracle({self._symbol}@{self._venue})"
+
     def fetch_price(self) -> Optional[float]:
-        """One-shot fetch of the current BTC/USDT price. Returns None on error."""
+        """One-shot fetch of the current <SYMBOL> price. Returns None on error."""
         try:
             resp = self._session.get(
-                f"{self._base}/api/v3/ticker/price",
+                f"{self._base}{self._prefix}/ticker/price",
                 params={"symbol": self._symbol},
                 timeout=5,
             )
@@ -64,7 +154,8 @@ class BinanceOracle:
             data = resp.json()
             return float(data["price"])
         except Exception as exc:  # noqa: BLE001 - log and continue, oracle must not crash the bot
-            log.warning("binance fetch_price failed: %s", exc)
+            log.warning("binance fetch_price failed (%s@%s): %s", self._symbol,
+                        self._venue, exc)
             return None
 
     def poll_once(self) -> Optional[PricePoint]:
@@ -131,14 +222,15 @@ class BinanceOracle:
         """Fetch recent 1H klines: [[open_time, open, high, low, close, ...], ...]."""
         try:
             resp = self._session.get(
-                f"{self._base}/api/v3/klines",
+                f"{self._base}{self._prefix}/klines",
                 params={"symbol": self._symbol, "interval": "1h", "limit": limit},
                 timeout=5,
             )
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
-            log.warning("binance klines_1h failed: %s", exc)
+            log.warning("binance klines_1h failed (%s@%s): %s", self._symbol,
+                        self._venue, exc)
             return []
 
     def price_at_second(self, ts: int) -> Optional[float]:
@@ -146,10 +238,18 @@ class BinanceOracle:
         kline REST endpoint (works even if our local rolling series doesn't
         cover that second, e.g. bot started mid-window). Uses the kline's
         open price (price at the start of that second).
+
+        Returns None on a venue with no 1s interval (USD-M futures). Falling
+        back to a coarser interval here would answer a different question than
+        the caller asked, so it answers nothing instead.
         """
+        if not self._supports_1s:
+            log.warning("price_at_second unavailable on venue %s (%s): no 1s kline "
+                        "interval", self._venue, self._symbol)
+            return None
         try:
             resp = self._session.get(
-                f"{self._base}/api/v3/klines",
+                f"{self._base}{self._prefix}/klines",
                 params={
                     "symbol": self._symbol,
                     "interval": "1s",
@@ -161,7 +261,8 @@ class BinanceOracle:
             resp.raise_for_status()
             rows = resp.json()
         except Exception as exc:  # noqa: BLE001
-            log.warning("binance price_at_second failed: %s", exc)
+            log.warning("binance price_at_second failed (%s@%s): %s", self._symbol,
+                        self._venue, exc)
             return None
         if not rows:
             return None
@@ -175,7 +276,7 @@ class BinanceOracle:
         """
         try:
             resp = self._session.get(
-                f"{self._base}/api/v3/klines",
+                f"{self._base}{self._prefix}/klines",
                 params={
                     "symbol": self._symbol,
                     "interval": "1h",
@@ -187,7 +288,8 @@ class BinanceOracle:
             resp.raise_for_status()
             rows = resp.json()
         except Exception as exc:  # noqa: BLE001
-            log.warning("binance hour_open_close failed: %s", exc)
+            log.warning("binance hour_open_close failed (%s@%s): %s", self._symbol,
+                        self._venue, exc)
             return None, None
         if not rows:
             return None, None
