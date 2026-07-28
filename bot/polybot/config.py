@@ -141,7 +141,10 @@ class Config:
         cfg = dict(self.snipe_cfg.get("warmup") or {})
         cfg.setdefault("enabled", True)
         cfg.setdefault("min_oracle_samples", 60)
-        cfg.setdefault("min_uptime_secs", 90)
+        # 120 == one full vol_window_secs, and matches the shipped config.yaml.
+        # A fallback LOOSER than what we ship would mean a pre-M4 config.yaml
+        # silently gets a weaker guard than the documented one.
+        cfg.setdefault("min_uptime_secs", 120)
         cfg.setdefault("log_every_secs", 15)
         return cfg
 

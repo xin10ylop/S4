@@ -153,15 +153,26 @@ strategy:
     # of adverse selection:
     #   levels > 5x the family median: 44 fills, 44/44 won, +38.1c/share
     #   normal levels:                189 fills, 175/189 won (92.6%), +22.4c/share
-    #   all 14 losing trades came from NORMAL-sized levels; worst LARGE trade +$14.91
+    #   at every threshold >=3x, all 14 losing trades came from NORMAL-sized
+    #     levels (worst LARGE trade +$14.91); at the loosest 2x cut exactly one
+    #     loser (ratio 2.06) falls on the LARGE side
     #   OLS pnl ~ log10(size_ratio) + price: size coef +0.051 (t=+2.87) — bigger
     #     is BETTER even after controlling for price; reproduced on an
     #     independent 359-trade wider sample (coef +0.051, t=+2.58).
     # Turning it on at 5x would have discarded 69% of realized PnL (skip mode)
-    # or 15% (cap mode) to prevent a loss that never occurred. See
-    # audit/M4_risk_guards.md §1. Re-run that measurement per coin before
-    # enabling for a new family — the mechanism (an informed seller) is real in
-    # principle, it simply is not what a big offer means on the 1h BTC book.
+    # or 15% (cap mode) to prevent a loss that never occurred.
+    #
+    # NOT UNANIMOUS, and the dissent is recorded rather than buried: of the
+    # three reference definitions tested, the market's OWN trailing-300s depth
+    # gives -10.6c/share (p=0.035, n=19) at its loosest 2x cut. Those trades are
+    # still +15.6c/share PROFITABLE — a dilution, not adverse selection — that
+    # cell is 1 of 15 tested, and the effect vanishes as the threshold tightens
+    # (p=0.26 at 3x, p=0.90 at 5x). See audit/M4_risk_guards.md §1.2b for the
+    # full argument. Neither reading justifies defaulting this ON.
+    #
+    # Re-run that measurement per coin before enabling for a new family — the
+    # mechanism (an informed seller) is real in principle, it simply is not what
+    # a big offer means on the 1h BTC book.
     adverse_size:
       enabled: false          # measured: no adverse effect on 1h BTC. Do not flip on vibes.
       mode: "cap"             # "cap" = take at most the ceiling from that level and keep
@@ -249,8 +260,8 @@ sizing:
 #
 # CALIBRATED ON THE MEASURED TAPE (236 fills / 121 trading days at shipped
 # parameters, audit/M4_risk_guards.md §3):
-#   worst single day        -$41.47   days worse than -$50: 0 of 121
-#   days worse than -$25:  2 of 121 (1.7%)
+#   worst single day        -$41.47   days worse than -$50: 0 of 119
+#   days worse than -$25:  2 of 119 (1.7%)
 #   longest losing streak:  3 trades (once); every other streak was 1
 # So $100/day and 4-in-a-row would NEVER have fired on the observed tape: this
 # is a breaker for genuine breakage (wrong feed, wrong side, regime change),

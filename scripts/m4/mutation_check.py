@@ -47,6 +47,21 @@ MUTATIONS = [
      "        now = time.time()\n        return sum(1 for p in self._series if now - p.ts <= window_secs)",
      "        now = self._series[-1].ts\n        return sum(1 for p in self._series if now - p.ts <= window_secs)"),
 
+    ("G2 config.py fallback default weaker than the shipped config",
+     "polybot/config.py",
+     "        cfg.setdefault(\"min_uptime_secs\", 120)",
+     "        cfg.setdefault(\"min_uptime_secs\", 1)"),
+
+    ("G2 WarmupGate constructor default weaker than the shipped config",
+     "polybot/risk.py",
+     "        self.min_uptime_secs = float(cfg.get(\"min_uptime_secs\", 120))",
+     "        self.min_uptime_secs = float(cfg.get(\"min_uptime_secs\", 0))"),
+
+    ("G3 delete the pre-dispatch breaker re-check (resolution lands mid-window)",
+     "polybot/engine.py",
+     "        br = self.breaker.allow_new_position()\n        if br.tripped:\n            log.error(\"skipping fill for %s: circuit breaker tripped (%s)\",",
+     "        br = self.breaker.allow_new_position()\n        if False:\n            log.error(\"skipping fill for %s: circuit breaker tripped (%s)\","),
+
     ("G3 delete breaker check from _maybe_snipe (pre-book)",
      "polybot/engine.py",
      "        br = self.breaker.allow_new_position()\n        if br.tripped:\n            if market.slug not in self._breaker_blocked_slugs:",

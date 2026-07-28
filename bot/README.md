@@ -10,7 +10,8 @@ their live-executability actually looks like.
 
 - **close_snipe** (primary; default ON for the `1h` family only): in a bounded
   band before a window closes — `tau in [tau_lo, snipe_last_secs]`, default
-  **[2.0s, 5.0s]**, where
+  **[2.5s, 5.0s]** (`snipe_min_tau_secs: 2.5` binds over
+  `latency_ms/1000 + snipe_fill_margin_secs = 2.0`), where
   `tau_lo = max(snipe_min_tau_secs, latency_ms/1000 + snipe_fill_margin_secs)`
   — compares the live Binance underlying price to a normal-CDF fair value and
   takes a mispriced ask if the edge clears `edge_min` after fees. The band is
@@ -71,9 +72,14 @@ shares at $0.50 and pooling them makes the statistic meaningless. The default
 is OFF **because the measurement refuted the hypothesis**: replaying shipped
 close_snipe over 6,523 1h closes, levels larger than 5x the family median went
 44-for-44 at +38.1c/share while normal levels went 175-for-189 (92.6%) at
-+22.4c/share — every losing trade came from a *normal*-sized offer. Enabling
-it at 5x would have discarded 69% of realized PnL (skip mode) to prevent a
-loss that never happened. The mechanism it guards (an informed seller) is real
++22.4c/share — at every threshold from 3x up, all 14 losing trades came from
+*normal*-sized offers. Enabling it at 5x would have discarded 69% of realized
+PnL (skip mode) to prevent a loss that never happened. The evidence is not
+unanimous and §1.2b of the audit records the dissent in full: of three
+reference definitions tested, the market's own trailing-300s depth gives
+−10.6c/share (p=0.035, n=19) at its loosest cut — but those trades are still
++15.6c/share profitable (a dilution, not adverse selection), it is 1 cell of
+15, and it decays to p=0.90 as the threshold tightens. The mechanism it guards (an informed seller) is real
 in principle — it is what poisoned `settle_sweep` 3-for-3 — but there the
 seller knew the Chainlink print and we were reading Binance; in close_snipe
 the information is the public BTC price, so a big resting offer is a stale
@@ -98,7 +104,7 @@ realized PnL since UTC midnight breaches
 **tighter**), or once `max_consecutive_losses` resolved trades in a row have
 lost. Resets automatically at UTC midnight (the daily figure is computed from
 UTC midnight — there is no cron and no state to clear). Applies to
-close_snipe *and* settle_sweep. Calibration: over 121 trading days the worst
+close_snipe *and* settle_sweep. Calibration: over 119 trading days the worst
 day was −$41.47, no day was worse than −$50, and the longest losing streak was
 3 — so the shipped $100/day and 4-in-a-row would never have fired on the
 observed tape. This is a breaker for genuine breakage, not a variance
@@ -121,7 +127,7 @@ like "alive with no signals".
 ### Verifying the guards are real
 
 `python3 scripts/m4/mutation_check.py` copies `bot/` to a temp dir, deletes or
-neuters each guard in turn (23 mutations), and requires the suite to go red
+neuters each guard in turn (26 mutations), and requires the suite to go red
 for every one. A previous audit of this project found a guard that could be
 removed entirely with a green suite; this is the standing check that it cannot
 happen again. Current result: **23/23 killed**.

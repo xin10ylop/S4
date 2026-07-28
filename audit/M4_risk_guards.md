@@ -14,7 +14,7 @@ both the paper and the LIVE order path, and one config line away from active.
 |---|---|---|---|
 | 1. Adverse-size filter | `strategy.close_snipe.adverse_size` | **OFF** | 6,523 1h closes: large offers won *more*, not less (§1) |
 | 2. Warmup after restart | `strategy.close_snipe.warmup` | **ON** — 60 samples + 120s | 19,569 evaluation ticks: cold sigma manufactures 25.5% extra, much worse trades (§2) |
-| 3. Daily loss limit + streak brake | `risk:` | **ON** — $100/day, 4 in a row | 121 trading days: worst day −$41.47, longest streak 3 (§3) |
+| 3. Daily loss limit + streak brake | `risk:` | **ON** — $100/day, 4 in a row | 119 trading days: worst day −$41.47, longest streak 3 (§3) |
 
 Nothing pre-existing was weakened. `fair_cap 0.98`, `sigma_1s_floor 8e-6`,
 `max_walk_above_best 0.03`, the `[2.5, 5.0]s` tau band, the three live-mode
@@ -102,8 +102,55 @@ Shipped parameters, 233 fills, 117 days, family-rolling per-side reference:
 | >8x  | 29 | **1.000** | +37.08 | 204 | 0.931 | +23.72 | **+13.36c** | 0.001 |
 | >10x | 28 | **1.000** | +36.72 | 205 | 0.932 | +23.84 | **+12.88c** | 0.002 |
 
-**Every one of the 14 losing trades came from a normal-sized level.** Worst
-LARGE (>5x) trade: **+$14.91**. Worst normal trade: **−$45.26**.
+The 14 losing trades sit at size ratios `0.04, 0.07, 0.09, 0.14, 0.17, 0.40,
+0.42, 0.43, 0.54, 0.63, 0.80, 1.38, 1.41, 2.06`. So **at every threshold from
+3x up, all 14 losses came from normal-sized levels**; at the loosest 2x cut a
+single loser (ratio 2.06) lands on the LARGE side, which is where that row's
+0.987 win rate comes from. Worst LARGE (>5x) trade: **+$14.91**. Worst normal
+trade: **−$45.26**.
+
+### 1.2b The one cut that goes the other way — reported in full
+
+`scripts/m4/analyse_depth.py` evaluates **three** reference definitions so the
+conclusion does not rest on one arbitrary choice. Two of them (family-rolling
+per-side, above; family-rolling pooled: +10.9c to +15.7c across thresholds, all
+p ≤ 0.001) agree. The third — **the market's own trailing 300s depth** —
+disagrees at its loosest threshold, and that must be on the record because it
+is the only cell of 15 in which the guard's premise is nominally supported:
+
+| own-market ref | n | win | c/share | diff vs normal | p |
+|---|---|---|---|---|---|
+| LARGE >2x | 19 | 0.895 | **+15.62** | **−10.64c** | **0.035** |
+| LARGE >3x | 12 | 1.000 | +20.53 | −5.13c | 0.264 |
+| LARGE >5x | 9 | 1.000 | +24.78 | −0.65c | 0.895 |
+| LARGE >8x | 7 | 1.000 | +26.01 | +0.63c | 0.915 |
+
+This reference is arguably the closer match to the audit's literal wording — "a
+counterparty *dumps* a large pile *seconds before* close" is a size jump
+relative to that market's own recent book, not relative to the family. So it
+deserves a straight answer rather than being dropped for disagreeing. Three
+things about it:
+
+1. **The flagged trades are still profitable.** +15.62c/share on 19 trades,
+   $970 of realized PnL, 2 losses, worst single trade −$24.45. That is a
+   *dilution* of the edge, not adverse selection — adverse selection means
+   negative expectancy, and this is well positive. A guard that skipped them
+   would have thrown away $970 (9% of total PnL) to avoid two small losses.
+2. **The statistic is close to degenerate.** 49.6% of fills have a ratio of
+   *exactly* 1.00 (p50 = p75 = 1.00), because a large order that has been
+   resting for the whole 300s window *is* its own reference. It cannot see the
+   thing it is supposed to see, which is why it was not the definition chosen
+   for the implementation.
+3. **It is one of 15 cells at p=0.035, uncorrected.** Across 3 references x 5
+   thresholds, one result at p≈0.04 is what multiple comparisons produce on
+   their own, and it decays to p=0.26 and p=0.90 as the threshold tightens —
+   the opposite of the dose-response you would expect from a real effect.
+
+**Net:** the honest summary is not "the data unanimously refutes the guard" but
+"two of three reference definitions show large offers are significantly
+*better*, and the third shows they are somewhat *less* good while still solidly
+profitable." Neither reading supports switching the guard ON by default. Both
+readings support implementing it and leaving it off, which is what shipped.
 
 ### 1.3 Confound controls
 
@@ -329,7 +376,7 @@ so high the bot never becomes warm and silently never trades.
 
 ### 3.1 Calibration from the tape
 
-236 fills over 121 trading days at shipped parameters:
+236 fills over 119 trading days (275 calendar days) at shipped parameters:
 
 | statistic | value |
 |---|---|
@@ -337,7 +384,7 @@ so high the bot never becomes warm and silently never trades.
 | days worse than −$25 | 2 of 121 (1.7%) |
 | days worse than −$50 | **0 of 121** |
 | longest consecutive-loss run | **3** (once; every other run was 1) |
-| trades/day | median 1, mean 1.95, max 13 |
+| trades/day (on days that traded) | median 1, mean 1.98, max 12 |
 
 **Shipped: `bankroll_usd 1250`, `max_daily_loss_pct 8.0` → $100/day;
 `max_consecutive_losses: 4`.** Neither would have fired once in 121 days. That

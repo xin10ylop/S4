@@ -93,7 +93,7 @@ class WarmupGate:
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", True))
         self.min_samples = int(cfg.get("min_oracle_samples", 60))
-        self.min_uptime_secs = float(cfg.get("min_uptime_secs", 90))
+        self.min_uptime_secs = float(cfg.get("min_uptime_secs", 120))
         self.log_every_secs = float(cfg.get("log_every_secs", 15))
         self.started_at = time.time() if started_at is None else started_at
         self._last_log = 0.0

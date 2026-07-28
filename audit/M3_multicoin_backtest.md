@@ -1,6 +1,7 @@
 # M3 — close_snipe backtested on every non-BTC hourly family
 
-**Date:** 2026-07-27 (UTC) · **Scope:** run the shipped `close_snipe` strategy, at the shipped
+**Date:** 2026-07-27 (UTC) · **Independently re-verified 2026-07-28** (§1.4 — one published table
+corrected, §4.3; no headline number changed) · **Scope:** run the shipped `close_snipe` strategy, at the shipped
 parameters, on all seven Polymarket hourly Up/Down families, and decide whether the bot goes from
 ~0.9 trades/day to ~5-6/day.
 **Sample:** 2026-05-08 → 2026-07-27 UTC, **81 days × 7 coins = 13,405 hourly closes** (1,915 per
@@ -43,11 +44,16 @@ Five findings, ordered by how much they change the plan:
    P(EV ≤ 0) = 0.080; positive in TRAIN (+4.9¢, 12 fills) and TEST (+20.0¢, 6 fills). It is
    suggestive, not proven. §2, §9.
 2. **`close_snipe` is not "the book has not caught up". It is a few points of edge over the
-   market-implied price, and it INVERTS where the model is most confident.** Pooled over all coins:
-   |z| ∈ (1, 5] wins **91.1% on 112 fills (+11.7 ¢/share)**; |z| > 5 wins **70.0% on 30 fills
-   (−5.4 ¢/share)** — **Fisher exact p = 0.0055**. For BTC alone: |z| ≤ 5 → 96.2% / +20.4¢ on 52
-   fills; |z| > 5 → **57.1% / −12.9¢** on 14. **This is a property of the shipped BTC strategy, not
-   of the new coins**, and it is the most actionable finding here. §4.3.
+   market-implied price, and it earns them only in a MIDDLE band of the model's own confidence.**
+   Pooled over all coins, win rate by `|z|` runs **51.6% → 86.3% → 95.1% → 71.4% → 66.7%** across
+   `<1 / 1–2 / 2–5 / 5–10 / >10` — an inverted U, losing at *both* ends for two mechanically
+   different reasons (§4.4 coarse-tick zero-move at the bottom, adverse selection against a pinned
+   `fair` at the top). |z| ∈ (1,5] wins **91.1% on 112 fills (+11.7 ¢/share)** against |z| > 5 at
+   **70.0% on 30 fills (−5.4 ¢/share)**, Fisher exact p = 0.0055 — but **that split was chosen after
+   seeing the table, and the neighbouring `|z| ≤ 2` vs `> 5` split gives p = 0.81**, so read it as a
+   lead, not a result. For BTC alone: |z| ≤ 5 → 96.2% / +20.4¢ on 52 fills; |z| > 5 → **57.1% /
+   −12.9¢** on 14. **This is a property of the shipped BTC strategy, not of the new coins**, and it
+   is the most actionable lead here — §7.1 shows it does not yet walk forward. §4.3.
 3. **The M1 competition/staleness hypothesis is REJECTED.** Cross-coin, EV/share vs median in-band
    depth r = +0.15, vs log volume r = −0.16, vs median quote age r = −0.10, vs p90 quote age
    r = +0.24 — every r² ≤ 0.06 on n = 7. Within the 173 fills,
@@ -179,6 +185,50 @@ TOTAL DISCREPANCIES: 0
 Different vendor tape, different period; the win rate lands within 0.4 points of live and the trade
 rate within 0.1/day.
 
+### 1.4 Independent re-verification pass, 2026-07-28
+
+A separate pass re-ran the harness end to end and recomputed the load-bearing statistics from the
+trade tape with independently written code (different bootstrap seed, different binning, no reuse of
+`m3_report.py`). What was checked and what it found:
+
+| check | method | result |
+|---|---|---|
+| **End-to-end reproducibility** | `replay_hourly.py` re-run from scratch on all 7 coins (3m34s), output compared field-by-field against the stored `trades_shipped.parquet` | **310 signals, 28 fields, 0 discrepancies** (rtol 1e-12) |
+| **Headline per-coin table (§2)** | ¢/share, win, trades/day, per-trade t, day-clustered t, $/day recomputed from the tape | **all 7 coins match to 4 s.f.** |
+| **Day-clustered 95% CIs (§2)** | mean of daily means ± 1.96·SE, recomputed | **all 7 match exactly** ([+5.2,+20.6] BTC, [−0.1,+26.4] ETH, …) |
+| **Bootstrap P(EV≤0) (§2)** | fresh 20,000-draw day-block bootstrap, independent seed | BTC 0.001, ETH 0.081, SOL 0.853, XRP 0.716, DOGE 0.420, BNB 0.566, HYPE 0.000, **non-BTC 0.309** — all within Monte-Carlo noise of the published 0.000/0.080/0.837/0.724/0.430/0.573/0.000/0.300 |
+| **Settle reconciliation (§1.3a)** | Up/Down re-derived from Binance candles (traded-print anchors) for bitcoin, bnb, ethereum | **1,915/1,915 each — 100.000%**, reproduced |
+| **Late sign-flip rates (§8.2b)** | recomputed over all 1,915 closes/coin | BTC **1.044%**, ETH **0.836%**, **BNB 2.193%** — exact match; BNB's 2.1x flip rate stands |
+| **Zero-move signals (§4.4)** | count of signals with `z` exactly 0 | SOL **10 of 42**, XRP **7 of 39**, DOGE **1 of 19** — exact match |
+| **Capacity percentiles (§6)** | p10/p50/p90 of fill-book notional recomputed | exact match (HYPE p10 $3.06 vs published $3.07, rounding) |
+| **Stress grid (§10)** | cross-checked against `t11_stress.csv` | exact match on every cell quoted |
+| **Win-vs-ask table (§4.2)** | recomputed with one-sided binomial vs mean fill ask | **all 9 rows match** (BTC +14.4 pt p=0.0037, non-BTC +3.2 pt p=0.268) |
+| **§4.3 \|z\| bucket table** | recomputed | ⚠️ **one row wrong — corrected in place; see §4.3** |
+| **§8.2c concurrency** | recounted from `t7c_concurrency.csv` and from the tape | ⚠️ **published 164/11/(7,1,3) is really 162/10/(7,0,3) — corrected in place** |
+| **§5 book-age table** | recomputed three ways | correct; the age convention was undocumented and is now stated in §5 |
+
+**Two defects were found. Both are reporting-script/transcription errors, neither is a harness or
+data bug, and neither changes a headline number or the recommendation:**
+
+1. **§4.3 `<1` row** — `pd.cut(..., right=True)` on bins starting at 0 dropped the 8 fills with
+   `|z|` exactly zero. The corrected row is *worse* than the published one (51.6% win / −1.6¢
+   against 65.2% / +7.6¢), so the correction moves in the conservative direction and sharpens the
+   section's conclusion from "inverts at the top" to "loses at **both** ends". `m3_report.py` is
+   patched with an assertion that the partition is total.
+2. **§8.2c concurrency counts** — 162 closes / 10 concurrent, not 164 / 11, and there was **no
+   all-lose concurrent hour** (the worst lost $0.43). This makes the observed joint tail *smaller*
+   than published; the sizing advice in §8.2b rests on the flip-rate analysis, not on this count,
+   and is unaffected.
+
+While correcting §4.3 the verification pass also found that its **p = 0.0055 is split-dependent** —
+the neighbouring `|z| ≤ 2` vs `> 5` split gives **p = 0.81**. That is now stated wherever the
+p-value appears (§0 finding 2, §4.3, §13 item 4). It does not change any recommendation, because
+§7.1 had already shown the |z| band fails walk-forward and the document already declined to ship it.
+
+**Everything else in this document reproduced.** In particular the two claims the decision rests on —
+non-BTC pooled +2.01 ¢/share with P(EV≤0) = 0.30, and the TRAIN→TEST collapse of BNB — are confirmed
+by independent recomputation.
+
 ---
 
 ## 2. Per-coin headline — shipped parameters, full 81-day sample
@@ -288,25 +338,53 @@ probability it pays?*
 BTC clears it; ETH and HYPE point the right way without significance; nothing else does, and the
 non-BTC pool does not.
 
-### 4.3 The inversion: least accurate exactly where most confident
+### 4.3 The confidence profile: an inverted U — the model loses at both ends of its own `|z|`
 
 Pooled over all seven coins, by the model's own `|z|` at entry:
 
 | \|z\| | fills | win rate | mean ask | ¢/share |
 |---|---|---|---|---|
-| < 1 | 23 | 65.2% | 0.560 | +7.6 |
+| **< 1** | **31** | **51.6%** | 0.515 | **−1.6** |
 | 1 – 2 | 51 | 86.3% | 0.766 | +8.5 |
 | **2 – 5** | **61** | **95.1%** | 0.798 | **+14.3** |
 | **5 – 10** | 21 | **71.4%** | 0.754 | **−5.0** |
 | **> 10** | 9 | **66.7%** | 0.720 | **−6.3** |
+| **all** | **173** | 80.3% | 0.729 | +6.3 |
 
-**|z| ∈ (1,5]: 112 fills, 91.1% win, +11.7 ¢/share. |z| > 5: 30 fills, 70.0% win, −5.4 ¢/share.
-Fisher exact p = 0.0055.** For BTC alone: |z| ≤ 5 → 52 fills, 96.2%, **+20.4¢**; |z| > 5 → 14 fills,
-57.1%, **−12.9¢**.
+> **Correction (2026-07-28 verification pass).** The `<1` row was previously published as
+> *23 fills / 65.2% / +7.6¢*. That was a binning defect in the reporting script, not in the harness:
+> `pd.cut(..., right=True)` on left-closed bins starting at 0 silently drops rows with `|z|` **exactly
+> zero**, and there are **8 such fills** — the zero-move closes of §4.4 (6 SOL, 2 XRP), which won
+> **1 of 8** at **−27.9 ¢/share**. Dropping them removed the worst fills from the worst bucket. The
+> corrected row is above; rows summing to 173 rather than 165 is the check that now passes.
+> **No headline number changes** — every aggregate below excludes the `<1` bucket by construction —
+> and the correction *strengthens* the section's conclusion: the model loses money at both ends of
+> its own confidence scale, not only at the top.
 
-The economics are obvious once stated: when `|z|` is enormous, `fair` is pinned at the 0.98 clip and
-the bot lifts *any* ask below ~0.94. The only reason such an ask exists is that somebody watching
-more than a 1-second last-trade print disagrees — and they are right more often than the model.
+**With the `<1` row corrected the shape is an inverted U, not a monotone inversion: the strategy
+loses at BOTH ends of its own confidence scale and makes all of its money in a middle band.**
+
+* **Low end** (`|z| < 1`, 31 fills, 51.6%, −1.6¢) — the coarse-tick / zero-move failure of §4.4:
+  `z ≈ 0` ⇒ `fair ≈ 0.500` on both sides, and `edge_min` fires against any ask ≤ 0.455 on zero
+  information. It is a coin flip bought at a discount that isn't one.
+* **High end** (`|z| > 5`, 30 fills, 70.0%, −5.4¢) — `fair` is pinned at the 0.98 clip and the bot
+  lifts *any* ask below ~0.94. The only reason such an ask is still standing is that somebody
+  watching more than a 1-second last-trade print disagrees, and they are right more often than the
+  model.
+
+**|z| ∈ (1,5]: 112 fills, 91.1% win, +11.7 ¢/share versus |z| > 5: 30 fills, 70.0% win,
+−5.4 ¢/share — Fisher exact p = 0.0055** (2×2 = [[102,10],[21,9]]). For BTC alone: |z| ≤ 5 → 52
+fills, 96.2%, **+20.4¢**; |z| > 5 → 14 fills, 57.1%, **−12.9¢**.
+
+> ⚠️ **That p-value is a post-hoc split and must be read as such.** The (1,5] boundary was chosen
+> after seeing the bucket table. The neighbouring split `|z| ≤ 2` vs `|z| > 5` — equally defensible
+> a priori — gives **p = 0.81**, because it pools the bad low end with the good middle. With five
+> buckets there are many admissible cut points and no multiplicity correction has been applied, so
+> **treat p = 0.0055 as "worth investigating", not as an established effect.** The corroboration that
+> does not depend on a chosen cut point is the monotone win-rate profile itself
+> (51.6 → 86.3 → 95.1 → 71.4 → 66.7%) and the fact that the two ends have *independent, mechanically
+> different* explanations. §7.1 then shows a |z| band does not walk forward.
+
 **This is a property of the shipped BTC strategy, not of the new coins,** and it belongs in the BTC
 workstream. §7.1 shows it is not yet a shippable rule.
 
@@ -360,7 +438,12 @@ durable structural reason to trade them. **It is not borne out.**
 Every relationship is a coin toss and the signs flip under fill weighting. **n = 7 has no power** —
 so the *within*-sample test matters more:
 
-**Within-sample (173 fills, all coins pooled), EV by book age at the fill:**
+**Within-sample (173 fills, all coins pooled), EV by book age.** *Age here is
+`max(signal-book age, fill-book age)`* — the worse of the two books the trade touched, which is the
+conservative reading of "how stale was the quote I traded against"
+(`m3_report.py:255`). Bucketing on the fill book alone gives 129/24/8/9/3 and
+`r = −0.090`; on the signal book alone 109/26/17/18/3 and `r = −0.071`. **All three give the same
+answer**, which is the point.
 
 | book age | fills | win | ¢/share | mean ask |
 |---|---|---|---|---|
@@ -479,8 +562,9 @@ the untouched **TEST** (32 days), $250 clip:
 both halves. Two runners-up look better on TEST but on 11-20 fills, which is exactly the sample size
 this project has learned not to trust (see BNB, §9).
 
-**Report: the |z| inversion is a real, significant property of the fill sample (§4.3, p = 0.0055).
-A |z| band is NOT a validated trading rule on this evidence and must not be shipped.** The right
+**Report: the |z| profile is a real property of the fill sample (§4.3) but its significance is
+split-dependent (p = 0.0055 on the chosen cut, p = 0.81 on the neighbouring one). A |z| band is NOT
+a validated trading rule on this evidence and must not be shipped.** The right
 next step is to test it on the BTC tape specifically, where n is largest and where the effect is
 strongest (52 fills at +20.4¢ vs 14 at −12.9¢).
 
@@ -529,8 +613,13 @@ the last-5-seconds flip — they are close to independent.** Hourly *returns* co
 argued. There is a real but small joint tail: 3-coin hours occur twice where 0.08 are expected
 (25x), so sizing should assume 3 concurrent losers is possible, not 1.
 
-**(c) Actual concurrency is negligible.** Of 164 closes that produced any fill, only **11 had ≥2
-concurrent fills** (7 all-win, 1 all-lose, 3 mixed). `max_open_notional` $1,000 never binds.
+**(c) Actual concurrency is negligible.** Of **162** closes that produced any fill, only **10 had ≥2
+concurrent fills** — 9 pairs and one triple — and they broke **7 all-win, 0 all-lose, 3 mixed**. The
+worst concurrent hour in 81 days lost **$0.43**. `max_open_notional` $1,000 never binds.
+*(Corrected 2026-07-28 from a published 164 / 11 / 7-1-3; the stored `t7c_concurrency.csv` has 162
+rows summing to 173 fills and contains no all-lose hour. The correction makes the joint-tail risk
+look smaller, not larger, so §8.2b's "assume 3 concurrent losers is possible" sizing advice stands
+on the flip-rate analysis rather than on any observed cluster.)*
 **Correlated edges are not why the expansion fails. It fails because five of the six new coins have
 no measurable edge.**
 
@@ -657,9 +746,12 @@ mandatory rather than advisory, and one is now cheaper than M1 thought:
 frequency is the goal, this document says to look at the 5m/15m families across coins (M1 §1.3: 383
 open 5m markets in a 30 h window against 28 hourly) rather than at more hourly coins — with the
 warning that those settle on Chainlink and the corrected 5m number at shipped parameters is
-+0.87¢ / t = 0.22 (C2 §6). The other candidate is §4.3: **fixing the |z| inversion on BTC may be
++0.87¢ / t = 0.22 (C2 §6). The other candidate is §4.3: **investigating the |z| profile on BTC may be
 worth more than any new coin** — BTC's |z| ≤ 5 subset is 52 fills at +20.4 ¢/share against +13.3¢
-for the whole.
+for the whole. That is a research lead on the largest sample this project has, not a rule to ship:
+§7.1 shows the TRAIN-selected band fails out of sample, and §4.3 shows the p-value moves from 0.0055
+to 0.81 under a neighbouring cut point. The right next step is to find the *mechanism* on BTC, not
+to fit a threshold.
 
 ---
 
@@ -674,10 +766,13 @@ for the whole.
 3. **The ETH recommendation rests on 18 fills** and P(EV≤0) = 0.080. Its $/day bootstrap CI
    [+$0.54, +$3.95] excludes zero only because its two losing fills happened to be small-notional.
    That is luck, not structure.
-4. **The |z| inversion is measured, not explained.** §4.3 shows *that* high-confidence fills lose;
-   it does not identify what the counterparty knows. Candidate explanations (order-book-derived
-   price, cross-exchange quotes, sub-tick information) are untested. Until one is confirmed, a |z|
-   cap is curve-fitting — and §7.1 shows it does not walk forward.
+4. **The |z| effect is measured, not explained, and its headline p-value is split-dependent.**
+   §4.3 shows *that* both tails of the confidence scale lose; it does not identify what the
+   counterparty knows at the top end. Candidate explanations (order-book-derived price,
+   cross-exchange quotes, sub-tick information) are untested. The p = 0.0055 comes from a cut point
+   chosen after seeing the data — `|z| ≤ 2` vs `> 5` gives p = 0.81 — and no multiplicity correction
+   has been applied. Until a mechanism is confirmed, a |z| band is curve-fitting, and §7.1 shows it
+   does not walk forward.
 5. **Concurrency under live load is still unmeasured** (M1 §6 item 8), though §8.2c shows only 11
    closes in 81 days had ≥2 concurrent fills, so the risk is smaller than M1 feared.
 6. **HYPE's live feed remains unverified from production** (M1 §6 item 1). Nothing here changes it.
@@ -696,7 +791,7 @@ for the whole.
 |---|---|
 | `scripts/multicoin/replay_hourly.py` | the harness (imports the property-tested bot primitives from `scripts/fresh5m/replay.py`) |
 | `scripts/multicoin/indep_hourly.py` | independently-written second replay of the data layer; 0 discrepancies (§1.3b) |
-| `scripts/multicoin/m3_report.py` | regenerates every table below |
+| `scripts/multicoin/m3_report.py` | regenerates every table below. **Patched 2026-07-28**: the §4.3 `\|z\|` binning dropped `\|z\|` exactly 0 (`pd.cut` left edge 0 with `right=True`); the bins are now left-open below zero and a `assert` requires the partition to be total, so the failure cannot recur silently. It also now prints both the (1,5] and the ≤2 split against `\|z\|>5`, so §4.3's split-sensitivity caveat is reproducible. |
 | `data/multicoin/m3/trades_shipped.parquet` | every signal, 7 coins, 81 days: fair, z, book ages, fill, P&L |
 | `data/multicoin/m3/trades_shipped_float32raw.parquet` | the pre-fix tape, kept so §1.3c is reproducible |
 | `t0_settle.csv` | §1.3a settle reconciliation |

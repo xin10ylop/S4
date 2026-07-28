@@ -496,24 +496,40 @@ def main():
         "all coins.  If the edge were 'the book has not caught up yet', win rate "
         "would RISE with |z|.")
     fz = tr_all[tr_all.outcome == "filled"].copy()
-    fz["zb"] = pd.cut(np.abs(fz.z), [0, 1, 2, 5, 10, 1e12],
+    # BUG FIX 2026-07-28: the left edge was 0 with pandas' default right=True,
+    # which puts |z| EXACTLY 0 outside every bin and silently drops it.  There
+    # are 8 such fills -- the zero-move closes of section 4.4 (6 SOL, 2 XRP),
+    # which won 1 of 8 at -27.9c/share, i.e. precisely the worst fills in the
+    # worst bucket.  The published "<1" row read 23 fills / 65.2% / +7.6c when
+    # it is really 31 fills / 51.6% / -1.6c.  Use a left edge below zero and
+    # assert the partition is total so this cannot recur silently.
+    fz["zb"] = pd.cut(np.abs(fz.z), [-1e-12, 1, 2, 5, 10, 1e12],
                       labels=["<1", "1-2", "2-5", "5-10", ">10"])
+    assert int(fz.zb.notna().sum()) == len(fz), (
+        f"|z| bucketing dropped {len(fz) - int(fz.zb.notna().sum())} of {len(fz)} fills")
     gz = (fz.groupby("zb", observed=True)
             .agg(n=("won", "size"), win=("won", "mean"), ask=("avg_price", "mean"),
                  ev=("pnl_per_share", "mean"), pnl=("pnl", "sum")).reset_index())
     show(gz, "t9b_win_by_z")
-    lo = fz[np.abs(fz.z) <= 2]
-    hi = fz[np.abs(fz.z) > 5]
-    if len(lo) and len(hi):
+    # Two splits: the report headlines the (1,5] vs >5 one, because the <1
+    # bucket is a DIFFERENT failure mode (zero-move closes, section 4.4) and
+    # pooling it with the good middle band muddles two effects.
+    az = np.abs(fz.z)
+    for name, lo in (("|z|in(1,5]", fz[(az > 1) & (az <= 5)]),
+                     ("|z|<=2    ", fz[az <= 2])):
+        hi = fz[az > 5]
+        if not (len(lo) and len(hi)):
+            continue
         try:
             from scipy.stats import fisher_exact
             odds, pv = fisher_exact([[int(lo.won.sum()), int((~lo.won).sum())],
                                      [int(hi.won.sum()), int((~hi.won).sum())]])
         except Exception:
             pv = np.nan
-        print(f"|z|<=2: {len(lo)} fills, win {lo.won.mean():.3f}, EV {lo.pnl_per_share.mean()*100:+.2f}c")
-        print(f"|z|> 5: {len(hi)} fills, win {hi.won.mean():.3f}, EV {hi.pnl_per_share.mean()*100:+.2f}c")
-        print(f"Fisher exact p = {pv:.4g}")
+        print(f"{name}: {len(lo)} fills, win {lo.won.mean():.3f}, "
+              f"EV {lo.pnl_per_share.mean()*100:+.2f}c   vs   "
+              f"|z|>5: {len(hi)} fills, win {hi.won.mean():.3f}, "
+              f"EV {hi.pnl_per_share.mean()*100:+.2f}c   Fisher exact p = {pv:.4g}")
     per = (fz.assign(hi=np.abs(fz.z) > 5).groupby(["coin", "hi"])
              .agg(n=("won", "size"), win=("won", "mean"),
                   ev=("pnl_per_share", "mean")).reset_index())

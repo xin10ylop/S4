@@ -361,6 +361,26 @@ class TestWarmupGate(unittest.TestCase):
         self.assertTrue(cfg.warmup_cfg["enabled"])
         self.assertGreaterEqual(int(cfg.warmup_cfg["min_oracle_samples"]), 60)
 
+    def test_code_fallback_is_never_looser_than_the_shipped_config(self):
+        """A config.yaml predating M4 must not get a WEAKER guard than the one
+        we ship and document. Both the config accessor default AND the
+        WarmupGate constructor default are checked, because either one being
+        loose is enough to silently downgrade the guard on an old file."""
+        with open(CONFIG_YAML) as f:
+            raw = yaml.safe_load(f)
+        shipped = dict(raw["strategy"]["close_snipe"]["warmup"])
+        raw["strategy"]["close_snipe"].pop("warmup", None)
+        fallback = Config(raw=raw, path=CONFIG_YAML).warmup_cfg
+        for key in ("min_oracle_samples", "min_uptime_secs"):
+            self.assertGreaterEqual(
+                float(fallback[key]), float(shipped[key]),
+                f"config.py fallback for {key} ({fallback[key]}) is looser than "
+                f"the shipped config ({shipped[key]})")
+        bare = WarmupGate({}, started_at=0.0)
+        self.assertTrue(bare.enabled)
+        self.assertGreaterEqual(bare.min_samples, float(shipped["min_oracle_samples"]))
+        self.assertGreaterEqual(bare.min_uptime_secs, float(shipped["min_uptime_secs"]))
+
 
 class TestOracleSampleCount(unittest.TestCase):
     def _oracle(self):
@@ -725,6 +745,37 @@ class TestBreakerBlocksTrading(unittest.TestCase):
         eng.ledger.today_pnl = 0.0
         eng._maybe_settle(FakeMarket(slug="s1", close_ts=self.now - 5.0), self.now)
         self.assertEqual(len(eng.executor.submissions), 1)
+
+    def test_breaker_is_rechecked_immediately_before_dispatch(self):
+        """The breaker is evaluated TWICE per snipe: once before the book
+        fetches and again immediately before the fill is dispatched, because a
+        resolution can land in between and turn a clean day into a stopped one.
+
+        This test isolates the SECOND check: the ledger reports a clean day on
+        the first evaluation and a breached one on every evaluation after, so
+        the pre-book gate passes (the books ARE fetched and the signal IS
+        recorded) and only the pre-dispatch gate can stop the fill. Deleting
+        that second check makes this test fail while every other breaker test
+        still passes.
+        """
+        led = self.eng.ledger
+        led._calls = 0
+        clean, breached = 0.0, -100.0
+
+        def flipping_pnl_today(_led=led):
+            _led._calls += 1
+            return {"net_pnl": clean if _led._calls <= 1 else breached}
+
+        led.pnl_today = flipping_pnl_today
+        self.eng._maybe_snipe(FakeMarket(slug="m", close_ts=self.now + 3.0), self.now)
+
+        self.assertGreater(led._calls, 1,
+                           "breaker was evaluated only once — there is no re-check")
+        # got past the pre-book gate: books were fetched and a signal recorded
+        self.assertNotEqual(self.eng.clob.calls, [])
+        self.assertEqual(len(self.eng.ledger.snipe_signals), 1)
+        # ...but the fill was never dispatched
+        self.assertEqual(self.eng.executor.submissions, [])
 
     def test_manual_override_lets_trading_resume(self):
         self.eng.ledger.today_pnl = -100.0
