@@ -6,13 +6,14 @@ in `bot/polybot/`, config-driven, backward compatible, and covered by tests
 that provably fail when the guard is removed.
 
 **Headline result.** Two of the three shipped **ON**. The third — the
-adverse-size filter — shipped **OFF by default because the measurement refuted
-its premise**, and the evidence is in §1. It is fully implemented, wired into
-both the paper and the LIVE order path, and one config line away from active.
+adverse-size filter — shipped **OFF by default because the measurement did not
+support it**, and the evidence, including the one cut that points the other
+way, is in §1. It is fully implemented, wired into both the paper and the LIVE
+order path, and one config line away from active.
 
 | Guard | Where | Default | Basis for the default |
 |---|---|---|---|
-| 1. Adverse-size filter | `strategy.close_snipe.adverse_size` | **OFF** | 6,523 1h closes: large offers won *more*, not less (§1) |
+| 1. Adverse-size filter | `strategy.close_snipe.adverse_size` | **OFF** | 6,523 1h closes: large offers won *more*, not less, on 2 of 3 reference definitions; the 3rd flags trades that are still profitable (§1, §1.2b) |
 | 2. Warmup after restart | `strategy.close_snipe.warmup` | **ON** — 60 samples + 120s | 19,569 evaluation ticks: cold sigma manufactures 25.5% extra, much worse trades (§2) |
 | 3. Daily loss limit + streak brake | `risk:` | **ON** — $100/day, 4 in a row | 119 trading days: worst day −$41.47, longest streak 3 (§3) |
 
@@ -342,11 +343,26 @@ so high the bot never becomes warm and silently never trades.
 **Shipped: `min_oracle_samples: 60`, `min_uptime_secs: 120`.**
 
 - 60 samples in a 120s window cuts contamination from 25.5% to 3.3%.
-- It is deliberately **not 90 or 120**. The oracle loop polls at
-  `(1.0s wait + fetch latency)`, and the dry run below measured a real steady
-  state of **99 samples per 120s (0.825 polls/s)**. A 90-sample gate would sit
-  9 samples from a permanent lockout on a slightly slower link; 60 tolerates an
-  effective 2.0s poll period.
+- It is deliberately **not 90 or 120**, and the dry runs settled that
+  empirically. The oracle loop polls at `(1.0s wait + fetch latency)`, so the
+  achieved rate depends on the link and on machine load. Four runs on this
+  machine:
+
+  | run | samples / uptime | polls/s | samples in 120s |
+  |---|---|---|---|
+  | A | 99 / 120s | 0.825 | 99 |
+  | B | 89 / 120s | 0.742 | 89 |
+  | C | 64 / 85s | 0.753 | 90 |
+  | D (loaded machine) | 52 / 81s | **0.642** | **77** |
+
+  **A 90-sample gate would have deadlocked three of these four runs** — the bot
+  would sit at `insufficient_oracle_samples` forever, silently never trading,
+  which is a strictly worse failure than the one being guarded. At 60 the
+  margin is the slowest observed rate (77 samples available vs 60 required,
+  **~22% headroom**). That headroom is real but not luxurious: it corresponds
+  to an effective poll period up to 2.0s. If the poller ever gets slower than
+  that — more coins sharing it, a slower link, a busier box — this gate
+  becomes the binding constraint on trading at all. See open item 3.
 - `min_uptime_secs: 120` — one full vol window of wall clock — is an
   independent condition, because a burst of duplicate polls after a network
   stall can satisfy a sample count but not a clock, and because it guarantees a
@@ -381,13 +397,13 @@ so high the bot never becomes warm and silently never trades.
 | statistic | value |
 |---|---|
 | worst single day | **−$41.47** |
-| days worse than −$25 | 2 of 121 (1.7%) |
-| days worse than −$50 | **0 of 121** |
+| days worse than −$25 | 2 of 119 (1.7%) |
+| days worse than −$50 | **0 of 119** |
 | longest consecutive-loss run | **3** (once; every other run was 1) |
 | trades/day (on days that traded) | median 1, mean 1.98, max 12 |
 
 **Shipped: `bankroll_usd 1250`, `max_daily_loss_pct 8.0` → $100/day;
-`max_consecutive_losses: 4`.** Neither would have fired once in 121 days. That
+`max_consecutive_losses: 4`.** Neither would have fired once in 119 days. That
 is deliberate: this is a breaker for genuine breakage (wrong feed, wrong side,
 regime change), not a variance throttle. `bankroll_usd: 1250` is the bot's true
 exposure ceiling — `max_open_notional` ($1,000) is evaluated *before* the new
@@ -448,7 +464,7 @@ roughly √6.
   "risk": {"tripped": false, "reasons": [], "daily_realized_pnl": 0.0,
            "daily_loss_limit_usd": 100.0, "consecutive_losses": 0,
            "max_consecutive_losses": 4, "override_active": false,
-           "override": null, "utc_day": "2026-07-27"},
+           "override": null, "utc_day": "2026-07-28"},
   "depth_reference": {"enabled": false, "mode": "cap", "max_size_ratio": 8.0,
                       "families": {}},
   "trading_blocked": true
@@ -472,63 +488,126 @@ warmup ON at 60/120, breaker ON at 8%/4, adverse-size filter OFF.
 by `test_off_by_default_takes_full_depth`. `_run_fill` gained two keyword
 arguments with defaults; the settle_sweep call site is unchanged.
 
+**A defaulting accessor is only backward compatible if its default is not
+weaker than what ships.** The first version of this failed that test: the
+`min_uptime_secs` fallback in `config.py` and `risk.py` was **90** while
+`config.yaml` and this document both said **120**, so an old config file would
+have quietly received a laxer warmup guard than the documented one. Both are
+now 120, and `test_code_fallback_is_never_looser_than_the_shipped_config`
+compares each fallback against the *shipped value read from `config.yaml`*
+rather than a hardcoded number, so the two cannot drift apart again. See §5.1.
+
 ---
 
 ## 5. Tests, and proof they are behavioural
 
-**Full suite: 212 tests, all passing** (was 136 before M4; +76).
+**Full suite: 214 tests, all passing** (was 136 before M4; +78, all in
+`bot/tests/test_risk_guards.py`).
 
 ```
 $ cd bot && python3 -m pytest tests -q
-212 passed in 6.77s
+214 passed in 24.07s
 ```
 
 The brief called this out explicitly — "the suite once passed while a guard
 could be deleted entirely". So the tests are backed by a mutation check:
-`scripts/m4/mutation_check.py` copies `bot/` to a temp dir, applies 23
+`scripts/m4/mutation_check.py` copies `bot/` to a temp dir, applies 26
 mutations that delete or neuter a guard, and requires the suite to go red for
-each one.
+each one. Every mutation is a change a careless refactor could plausibly make.
 
 ```
 $ python3 scripts/m4/mutation_check.py
-baseline: GREEN  (212 passed in 7.78s)
-  killed    G2 delete warmup gate from _maybe_snipe
-  killed    G2 WarmupGate.check always ready
-  killed    G2 warmup uptime condition removed
-  killed    G2 missing-n_samples oracle treated as warm
-  killed    G2 n_samples anchored on newest point instead of the clock
-  killed    G3 delete breaker check from _maybe_snipe (pre-book)
-  killed    G3 delete breaker check from _maybe_settle
-  killed    G3 daily loss limit never trips
-  killed    G3 consecutive-loss brake never trips
-  killed    G3 combine pct/usd limits the LOOSE way
-  killed    G3 override is not scoped to a UTC day
-  killed    G3 corrupt override resumes trading
-  killed    G3 streak does not reset at UTC midnight
-  killed    G3 pnl_today ignores the UTC-midnight boundary
-  killed    G3 consecutive_losses ignores since_ts
-  killed    G3 a winning trade does not reset the streak
-  killed    G1 adverse-size filter removed from walk_asks
-  killed    G1 skip mode re-baselines the walk bound
-  killed    G1 depth reference pools out-of-band levels
-  killed    G1 reference returned before min_samples
-  killed    G1 filter not threaded into the live order path
-  killed    G1 engine never computes a level ceiling
-  killed    G1/G2/G3 guards missing from status.json
+baseline: GREEN  (214 passed in 12.26s)
 
-23/23 mutations killed by the suite
+  killed    G2 delete warmup gate from _maybe_snipe   (FAILED tests/test_risk_guards.py::TestWarmupBlocksTrading::test_boundary_is_inclusive_at_the_configured_minimum)
+  killed    G2 WarmupGate.check always ready   (FAILED tests/test_risk_guards.py::TestWarmupGate::test_blocks_on_thin_buffer)
+  killed    G2 warmup uptime condition removed   (FAILED tests/test_risk_guards.py::TestWarmupGate::test_blocks_on_short_uptime_even_with_a_full_buffer)
+  killed    G2 missing-n_samples oracle treated as warm   (FAILED tests/test_risk_guards.py::TestWarmupGate::test_none_oracle_reads_as_cold)
+  killed    G2 n_samples anchored on newest point instead of the clock   (FAILED tests/test_risk_guards.py::TestOracleSampleCount::test_counts_only_points_inside_the_window)
+  killed    G2 config.py fallback default weaker than the shipped config   (FAILED tests/test_risk_guards.py::TestWarmupGate::test_code_fallback_is_never_looser_than_the_shipped_config)
+  killed    G2 WarmupGate constructor default weaker than the shipped config   (FAILED tests/test_risk_guards.py::TestWarmupGate::test_code_fallback_is_never_looser_than_the_shipped_config)
+  killed    G3 delete the pre-dispatch breaker re-check (resolution lands mid-window)   (FAILED tests/test_risk_guards.py::TestBreakerBlocksTrading::test_breaker_is_rechecked_immediately_before_dispatch)
+  killed    G3 delete breaker check from _maybe_snipe (pre-book)   (FAILED tests/test_risk_guards.py::TestBreakerBlocksTrading::test_snipe_blocked_before_any_book_fetch)
+  killed    G3 delete breaker check from _maybe_settle   (FAILED tests/test_risk_guards.py::TestBreakerBlocksTrading::test_settle_sweep_is_blocked_too)
+  killed    G3 daily loss limit never trips   (FAILED tests/test_risk_guards.py::TestCircuitBreaker::test_clear_override_rearms_immediately)
+  killed    G3 consecutive-loss brake never trips   (FAILED tests/test_risk_guards.py::TestCircuitBreaker::test_consecutive_loss_brake)
+  killed    G3 combine pct/usd limits the LOOSE way   (FAILED tests/test_risk_guards.py::TestDailyLimitResolution::test_tighter_of_the_two_wins)
+  killed    G3 override is not scoped to a UTC day   (FAILED tests/test_risk_guards.py::TestCircuitBreaker::test_override_is_scoped_to_one_utc_day)
+  killed    G3 corrupt override resumes trading   (FAILED tests/test_risk_guards.py::TestCircuitBreaker::test_corrupt_override_does_not_resume_trading)
+  killed    G3 streak does not reset at UTC midnight   (FAILED tests/test_risk_guards.py::TestLedgerBreakerInputs::test_breaker_auto_resets_at_utc_midnight)
+  killed    G3 pnl_today ignores the UTC-midnight boundary   (FAILED tests/test_risk_guards.py::TestLedgerBreakerInputs::test_breaker_auto_resets_at_utc_midnight)
+  killed    G3 consecutive_losses ignores since_ts   (FAILED tests/test_risk_guards.py::TestLedgerBreakerInputs::test_breaker_auto_resets_at_utc_midnight)
+  killed    G3 a winning trade does not reset the streak   (FAILED tests/test_risk_guards.py::TestLedgerBreakerInputs::test_a_win_resets_the_streak)
+  killed    G1 adverse-size filter removed from walk_asks   (FAILED tests/test_risk_guards.py::TestAdverseSizeWalk::test_cap_mode_limits_shares_taken_from_anomalous_level)
+  killed    G1 skip mode re-baselines the walk bound   (FAILED tests/test_risk_guards.py::TestAdverseSizeWalk::test_skip_cannot_rebaseline_the_walk_bound)
+  killed    G1 depth reference pools out-of-band levels   (FAILED tests/test_risk_guards.py::TestDepthStatistic::test_out_of_band_levels_are_not_recorded)
+  killed    G1 reference returned before min_samples   (FAILED tests/test_risk_guards.py::TestDepthStatistic::test_reference_is_none_until_min_samples)
+  killed    G1 filter not threaded into the live order path   (FAILED tests/test_risk_guards.py::TestAdverseSizeWiring::test_live_router_forwards_the_filter_to_the_live_order_path)
+  killed    G1 engine never computes a level ceiling   (FAILED tests/test_risk_guards.py::TestAdverseSizeWiring::test_enabled_passes_ratio_times_reference)
+  killed    G1/G2/G3 guards missing from status.json   (FAILED tests/test_risk_guards.py::TestGuardStatusSurface::test_status_cli_prints_the_guard_section)
+
+26/26 mutations killed by the suite
 All guard mutations are caught by the test suite.
 ```
 
-Two mutations survived the first pass (`corrupt override resumes trading`,
-`streak does not reset at UTC midnight`) — both were real gaps where the test
-asserted an outcome the mutant happened to preserve. Two tests were added
-(`test_corrupt_override_does_not_resume_trading` now also asserts
-`override_active is False`; `test_breaker_auto_resets_at_utc_midnight` runs the
-real `Ledger` + real `CircuitBreaker` end-to-end) and both mutants now die.
+### 5.1 Three real gaps this process found
 
-Note also that adding guard 2 immediately turned **6 pre-existing tests red** —
-the warmup gate was blocking fills those tests expected. Those tests now call
+The mutation check is not decoration — it found defects on three separate
+passes, each of which is now fixed:
+
+1. **`corrupt override resumes trading`** and **`streak does not reset at UTC
+   midnight`** survived the first pass: the tests asserted an outcome the
+   mutant happened to preserve. Fixed by strengthening
+   `test_corrupt_override_does_not_resume_trading` (it now also asserts
+   `override_active is False`) and by making
+   `test_breaker_auto_resets_at_utc_midnight` run the real `Ledger` and the
+   real `CircuitBreaker` end-to-end instead of stubs.
+
+2. **The code fallback for `min_uptime_secs` was 90 while the shipped
+   `config.yaml` and this document both said 120.** A `config.yaml` written
+   before M4 — precisely the backward-compatibility case §4 promises — would
+   have silently received a *weaker* warmup guard than the documented one.
+   Fixed in `config.py` and `risk.py` (both now default 120), and locked down
+   by `test_code_fallback_is_never_looser_than_the_shipped_config`, which
+   compares every fallback against the shipped value rather than against a
+   hardcoded number, so the two can never drift apart again.
+
+3. **The pre-dispatch breaker re-check was completely untested.** The breaker
+   is evaluated twice per snipe — once before the book fetches and again
+   immediately before the fill is dispatched, because a resolution can land in
+   between. Deleting the *second* check left the suite green: every existing
+   breaker test tripped the breaker before the first gate, so the second one
+   never mattered to any assertion. That is exactly the failure mode the brief
+   warned about, found in our own new code. Fixed by
+   `test_breaker_is_rechecked_immediately_before_dispatch`, which uses a ledger
+   that reports a clean day on the first evaluation and a breached one
+   afterwards, then asserts that the books *were* fetched and the signal *was*
+   recorded (so the pre-book gate passed) but no fill was dispatched.
+
+### 5.2 What the tests assert
+
+Design rule for `test_risk_guards.py`: every test asserts **observable
+behaviour** — fills dispatched, shares taken, positions blocked, bytes in
+`status.json` — never the existence of a function or a config key. Coverage by
+guard:
+
+| Area | Tests |
+|---|---|
+| Depth statistic (in-band only, per-family, bounded history, inert below `min_samples`) | 5 |
+| `walk_asks` size filter (off by default, cap, skip, cannot re-baseline the walk bound, `adverse_size_blocked` outcome) | 6 |
+| Filter wiring (engine ceiling, depth fed from books already fetched, **live** order path) | 5 |
+| Warmup gate (thin buffer, short uptime, missing/None/broken oracle, logging, defaults) | 10 |
+| `n_samples` wall-clock anchoring (incl. dead-feed reads 0, not a full buffer) | 3 |
+| Warmup blocks trading (before any book fetch; boundary inclusive) | 5 |
+| Daily-limit resolution (pct, tighter-of-two, unconfigured, sign) | 4 |
+| Circuit breaker (trips, profit never trips, streak, per-leg disable, override semantics incl. re-arming and corrupt-file) | 11 |
+| UTC reset + ledger inputs (per resolved market not per fill, day scoping, real-Ledger end-to-end) | 9 |
+| Breaker blocks trading (snipe, settle_sweep, pre-book, **pre-dispatch**, override resumes) | 7 |
+| Status surface + `resume`/`halt` CLI | 7 |
+| Nothing pre-existing weakened | 7 |
+
+Adding guard 2 immediately turned **6 pre-existing tests red** — the warmup
+gate was blocking fills those tests expected. They now call
 `tests.test_engine_gating.warm()` explicitly, which is itself the property we
 want: the guard is on by default and cannot be bypassed by accident.
 
@@ -536,97 +615,145 @@ want: the guard is on by default and cannot be bypassed by accident.
 
 ## 6. Dry run
 
-```
-$ cd bot && POLYBOT_PORT=8917 timeout 90 python3 -m polybot.main run
-2026-07-27T23:09:39.158Z INFO    polybot.engine: starting engine: mode=PAPER
-2026-07-27T23:09:39.159Z INFO    polybot.engine: close_snipe window: tau in [2.50, 5.00]s (latency_ms=1500)
-2026-07-27T23:09:39.159Z INFO    polybot.engine: M4 guard 1 adverse_size: enabled=False mode=cap max_size_ratio=8.0 history_n=200 min_samples=30
-2026-07-27T23:09:39.159Z INFO    polybot.engine: M4 guard 2 warmup: enabled=True min_oracle_samples=60 min_uptime_secs=120 (vol_window=120s)
-2026-07-27T23:09:39.159Z INFO    polybot.engine: M4 guard 3 circuit breaker: daily_limit=$100.00 consecutive_loss_brake=4 override_path=/home/user/S4/bot/data/risk_override.json
-2026-07-27T23:09:39.160Z INFO    polybot.engine: status HTTP server listening on :8917 (/status, /health)
-2026-07-27T23:09:42.269Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-27-2026-6pm-et family=1h close=2026-07-27T23:00:00+00:00
-2026-07-27T23:09:42.269Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-27-2026-7pm-et family=1h close=2026-07-28T00:00:00+00:00
-2026-07-27T23:09:42.269Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-27-2026-8pm-et family=1h close=2026-07-28T01:00:00+00:00
-2026-07-27T23:09:42.269Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-27-2026-9pm-et family=1h close=2026-07-28T02:00:00+00:00
-2026-07-27T23:09:42.269Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-27-2026-10pm-et family=1h close=2026-07-28T03:00:00+00:00
-2026-07-27T23:09:42.269Z INFO    polybot.engine: discovered market: btc-updown-5m-1785193200 family=5m close=2026-07-27T23:05:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785193500 family=5m close=2026-07-27T23:10:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785193800 family=5m close=2026-07-27T23:15:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785194100 family=5m close=2026-07-27T23:20:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-15m-1785193200 family=15m close=2026-07-27T23:15:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-15m-1785194100 family=15m close=2026-07-27T23:30:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-15m-1785195000 family=15m close=2026-07-27T23:45:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-4h-1785182400 family=4h close=2026-07-28T00:00:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-4h-1785196800 family=4h close=2026-07-28T04:00:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-4h-1785211200 family=4h close=2026-07-28T08:00:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-15m-1785279600 family=15m close=2026-07-28T23:15:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785279600 family=5m close=2026-07-28T23:05:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785279300 family=5m close=2026-07-28T23:00:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-29-2026-7pm-et family=1h close=2026-07-30T00:00:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785279000 family=5m close=2026-07-28T22:55:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-15m-1785278700 family=15m close=2026-07-28T23:00:00+00:00
-2026-07-27T23:09:42.270Z INFO    polybot.engine: discovered market: btc-updown-5m-1785278700 family=5m close=2026-07-28T22:50:00+00:00
-2026-07-27T23:09:42.271Z INFO    polybot.engine: discovery: 22 markets tracked (22 new)
-2026-07-27T23:09:42.271Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=1/60 uptime=3/120s — refusing to trade on a thin vol buffer
-2026-07-27T23:09:57.280Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=13/60 uptime=18/120s — refusing to trade on a thin vol buffer
-2026-07-27T23:10:12.288Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=24/60 uptime=33/120s — refusing to trade on a thin vol buffer
-2026-07-27T23:10:12.506Z INFO    polybot.engine: discovered market: btc-updown-5m-1785194400 family=5m close=2026-07-27T23:25:00+00:00
-2026-07-27T23:10:12.506Z INFO    polybot.engine: discovery: 20 markets tracked (1 new)
-2026-07-27T23:10:27.294Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=36/60 uptime=48/120s — refusing to trade on a thin vol buffer
-2026-07-27T23:10:42.305Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=48/60 uptime=63/120s — refusing to trade on a thin vol buffer
-2026-07-27T23:10:44.063Z INFO    polybot.engine: discovery: 20 markets tracked (0 new)
-2026-07-27T23:10:57.309Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=61/60 uptime=78/120s — refusing to trade on a thin vol buffer
-2026-07-27T23:11:08.943Z INFO    polybot.engine: stopping engine
-```
-
-All three guards announce themselves at boot. The warmup gate is visibly
-counting up (1 → 13 → 24 → 36 → 48 → 61 samples) and correctly switches its
-reason from `insufficient_oracle_samples` to `insufficient_uptime` once the
-sample count clears 60 at t=78s.
-
-A longer run to observe completion (same command, `timeout 170`):
+`timeout 90 python3 -m polybot.main run` (paper mode, live Gamma/CLOB/Binance,
+2026-07-28). Verbatim:
 
 ```
-23:15:21.054Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=63/60 uptime=77/120s
-23:15:36.057Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=76/60 uptime=92/120s
-23:15:51.066Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=88/60 uptime=107/120s
-23:16:04.069Z INFO    polybot.risk: close_snipe WARMUP COMPLETE: 99 oracle samples, uptime 120s — trading enabled
+2026-07-28T10:41:16.981Z INFO    polybot.engine: starting engine: mode=PAPER
+2026-07-28T10:41:16.982Z INFO    polybot.engine: close_snipe window: tau in [2.50, 5.00]s (latency_ms=1500)
+2026-07-28T10:41:16.982Z INFO    polybot.engine: M4 guard 1 adverse_size: enabled=False mode=cap max_size_ratio=8.0 history_n=200 min_samples=30
+2026-07-28T10:41:16.982Z INFO    polybot.engine: M4 guard 2 warmup: enabled=True min_oracle_samples=60 min_uptime_secs=120 (vol_window=120s)
+2026-07-28T10:41:16.982Z INFO    polybot.engine: M4 guard 3 circuit breaker: daily_limit=$100.00 consecutive_loss_brake=4 override_path=/home/user/S4/bot/data/risk_override.json
+2026-07-28T10:41:16.983Z INFO    polybot.engine: status HTTP server listening on :8931 (/status, /health)
+2026-07-28T10:41:26.868Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-28-2026-6am-et family=1h close=2026-07-28T11:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-28-2026-7am-et family=1h close=2026-07-28T12:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-28-2026-8am-et family=1h close=2026-07-28T13:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-28-2026-9am-et family=1h close=2026-07-28T14:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785234900 family=5m close=2026-07-28T10:40:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785235200 family=5m close=2026-07-28T10:45:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785235500 family=5m close=2026-07-28T10:50:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785235800 family=5m close=2026-07-28T10:55:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-15m-1785234600 family=15m close=2026-07-28T10:45:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-15m-1785235500 family=15m close=2026-07-28T11:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-15m-1785236400 family=15m close=2026-07-28T11:15:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-4h-1785225600 family=4h close=2026-07-28T12:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-4h-1785240000 family=4h close=2026-07-28T16:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-4h-1785254400 family=4h close=2026-07-28T20:00:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785320700 family=5m close=2026-07-29T10:30:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785320400 family=5m close=2026-07-29T10:25:00+00:00
+2026-07-28T10:41:26.869Z INFO    polybot.engine: discovered market: btc-updown-5m-1785320100 family=5m close=2026-07-29T10:20:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-15m-1785320100 family=15m close=2026-07-29T10:30:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785319800 family=5m close=2026-07-29T10:15:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785319500 family=5m close=2026-07-29T10:10:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-15m-1785319200 family=15m close=2026-07-29T10:15:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785319200 family=5m close=2026-07-29T10:05:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785318900 family=5m close=2026-07-29T10:00:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: bitcoin-up-or-down-july-30-2026-6am-et family=1h close=2026-07-30T11:00:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785318600 family=5m close=2026-07-29T09:55:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-15m-1785318300 family=15m close=2026-07-29T10:00:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785318300 family=5m close=2026-07-29T09:50:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785318000 family=5m close=2026-07-29T09:45:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovered market: btc-updown-5m-1785317700 family=5m close=2026-07-29T09:40:00+00:00
+2026-07-28T10:41:26.870Z INFO    polybot.engine: discovery: 29 markets tracked (29 new)
+2026-07-28T10:41:26.871Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=6/60 uptime=10/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:41:41.880Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=18/60 uptime=25/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:41:55.862Z INFO    polybot.engine: discovery: 29 markets tracked (0 new)
+2026-07-28T10:41:56.885Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=29/60 uptime=40/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:42:11.890Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=41/60 uptime=55/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:42:26.917Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=52/60 uptime=70/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:42:29.604Z INFO    polybot.engine: discovered market: btc-updown-15m-1785321000 family=15m close=2026-07-29T10:45:00+00:00
+2026-07-28T10:42:29.605Z INFO    polybot.engine: discovered market: btc-updown-5m-1785321000 family=5m close=2026-07-29T10:35:00+00:00
+2026-07-28T10:42:29.605Z INFO    polybot.engine: discovery: 31 markets tracked (2 new)
+2026-07-28T10:42:41.951Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=64/60 uptime=85/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:42:46.746Z INFO    polybot.engine: stopping engine
 ```
 
-**Measured steady-state poll rate: 99 samples per 120s = 0.825/s.** This is the
-empirical justification for choosing 60 over 90: a 90-sample gate would sit 9
-samples away from a permanent lockout on this very machine.
+All three guards announce themselves at boot with their effective parameters.
+The warmup gate is visibly counting up (6 -> 18 -> 29 -> 41 -> 52 -> 64
+samples) and correctly switches its reason from `insufficient_oracle_samples`
+to `insufficient_uptime` the moment the sample count clears 60 at t=85s — both
+conditions are independently enforced, exactly as designed. No trade could
+have fired in this window, and the log says so on every line rather than going
+quiet.
 
-Live status endpoint mid-warmup, showing all three guards and the
-`trading_blocked` flag:
+### 6.1 A longer run, to observe completion
+
+Same command with `timeout 150`, so the 120s uptime condition is reached:
 
 ```
-$ curl -s localhost:8917/status | jq .guards
+2026-07-28T10:44:22.638Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_oracle_samples): family=startup oracle_samples=57/60 uptime=77/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:44:37.648Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=66/60 uptime=92/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:44:52.649Z WARNING polybot.risk: close_snipe WARMING UP (insufficient_uptime): family=startup oracle_samples=78/60 uptime=107/120s — refusing to trade on a thin vol buffer
+2026-07-28T10:45:05.653Z INFO    polybot.risk: close_snipe WARMUP COMPLETE: 89 oracle samples, uptime 120s — trading enabled
+```
+
+**This run polled at 89 samples per 120s = 0.742/s** (an earlier run measured
+99/120s = 0.825/s). This is the empirical case for `min_oracle_samples: 60`
+rather than 90: **a 90-sample gate would have deadlocked this very run**, and
+a bot that silently never trades is a worse failure than the cold-sigma
+trades the guard exists to prevent.
+
+### 6.2 `status.json` mid-warmup
+
+```
+$ curl -s localhost:8932/status | jq .guards
 {
-  "warmup": {"ready": false, "reason": "insufficient_oracle_samples",
-             "oracle_samples": 14, "required_oracle_samples": 60,
-             "uptime_secs": 20.6, "required_uptime_secs": 120.0, "oracle": "binance"},
-  "risk": {"tripped": false, "reasons": [], "daily_realized_pnl": 0.0,
-           "daily_loss_limit_usd": 100.0, "consecutive_losses": 0,
-           "max_consecutive_losses": 4, "override_active": false,
-           "override": null, "utc_day": "2026-07-27"},
-  "depth_reference": {"enabled": false, "mode": "cap", "max_size_ratio": 8.0, "families": {}},
+  "warmup": {
+    "ready": false,
+    "reason": "insufficient_oracle_samples",
+    "oracle_samples": 16,
+    "required_oracle_samples": 60,
+    "uptime_secs": 25.0,
+    "required_uptime_secs": 120.0,
+    "oracle": "binance"
+  },
+  "risk": {
+    "tripped": false,
+    "reasons": [],
+    "daily_realized_pnl": 0.0,
+    "daily_loss_limit_usd": 100.0,
+    "consecutive_losses": 0,
+    "max_consecutive_losses": 4,
+    "override_active": false,
+    "override": null,
+    "utc_day": "2026-07-28"
+  },
+  "depth_reference": {
+    "enabled": false,
+    "mode": "cap",
+    "max_size_ratio": 8.0,
+    "families": {}
+  },
   "trading_blocked": true
 }
 ```
 
-Status CLI once warm:
+`guards.trading_blocked` is the single boolean an alerting rule should watch:
+"alive but deliberately not trading" otherwise looks exactly like "alive with
+no signals".
+
+### 6.3 Status CLI
 
 ```
 $ python3 -m polybot.main status
 --- Risk guards (M4) ---
-  trading allowed
-  warmup:  ready=True (warm)  oracle_samples=99/60  uptime=167.3/120.0s
-  breaker: tripped=False  daily_realized=$0.00  limit=$100.00  consecutive_losses=0/4  utc_day=2026-07-27
+  !! TRADING BLOCKED !!
+  warmup:  ready=False (insufficient_oracle_samples)  oracle_samples=19/60  uptime=28.0/120.0s
+  breaker: tripped=False  daily_realized=$0.00  limit=$100.00  consecutive_losses=0/4  utc_day=2026-07-28
   adverse-size filter: enabled=False mode=cap max_size_ratio=8.0
 ```
 
-Override CLI:
+...and once warm:
+
+```
+--- Risk guards (M4) ---
+  trading allowed
+  warmup:  ready=True (warm)  oracle_samples=92/60  uptime=146.1/120.0s
+  breaker: tripped=False  daily_realized=$0.00  limit=$100.00  consecutive_losses=0/4  utc_day=2026-07-28
+  adverse-size filter: enabled=False mode=cap max_size_ratio=8.0
+```
+
+### 6.4 Override CLI
 
 ```
 $ python3 -m polybot.main resume
@@ -635,11 +762,13 @@ Circuit breaker is NOT tripped — nothing to resume.
   (use --force to pre-authorise an override for today anyway)
 
 $ python3 -m polybot.main resume --force
-WARNING polybot.risk: RISK OVERRIDE GRANTED for 2026-07-27 at daily pnl $0.00 — trading resumes;
+WARNING polybot.risk: RISK OVERRIDE GRANTED for 2026-07-28 at daily pnl $0.00 — trading resumes;
                       the breaker re-arms if the day loses another full limit
 Override written to /home/user/S4/bot/data/risk_override.json
-  utc_day=2026-07-27  pnl_at_override=$0.00
+  utc_day=2026-07-28  pnl_at_override=$0.00
   breaker now tripped=False
+  The override expires at UTC midnight and re-arms if the day loses another full limit.
+  A running bot picks it up within one tick.
 
 $ python3 -m polybot.main halt
 WARNING polybot.risk: risk override cleared
@@ -667,14 +796,14 @@ No git commit was made.
 | `bot/polybot/main.py` | `Risk guards (M4)` status section; `resume` / `halt` subcommands |
 | `bot/config.yaml` | three commented config blocks with the measurements that set each default |
 | `bot/README.md` | "Risk guards (M4)" section, file tree, test instructions |
-| `bot/tests/test_risk_guards.py` | **new** — 74 behavioural tests |
+| `bot/tests/test_risk_guards.py` | **new** — 78 behavioural tests |
 | `bot/tests/test_engine_gating.py` | `n_samples`/breaker methods on stubs, explicit `warm()` helper |
 | `scripts/m4/replay_depth.py` | shipped-parameter replay recording depth statistics |
 | `scripts/m4/analyse_depth.py` | large-vs-normal outcome comparison, three reference definitions |
 | `scripts/m4/controls_depth.py` | price/regime confound controls |
 | `scripts/m4/warmup_sigma.py` | sigma_n vs sigma_120, fair error, decision error |
 | `scripts/m4/warmup_decision.py` | cold-only trade economics + lockout cost |
-| `scripts/m4/mutation_check.py` | 23-mutation proof that the guard tests are behavioural |
+| `scripts/m4/mutation_check.py` | 26-mutation proof that the guard tests are behavioural |
 
 Artifacts: `data/c2/m4_depth_fills.parquet`, `m4_depth_evals.parquet`,
 `m4_depth_fills_wide.parquet`, `m4_warmup.parquet`.
@@ -690,11 +819,24 @@ Artifacts: `data/c2/m4_depth_fills.parquet`, `m4_depth_evals.parquet`,
 2. **Circuit-breaker thresholds are calibrated for one coin at ~2 trades/day.**
    Re-derive `max_daily_loss_pct` and `max_consecutive_losses` from the
    multicoin daily-PnL distribution before running ~6 coins.
-3. **The warmup threshold is tied to the observed 0.825 polls/s.** If the
-   oracle loop is ever changed (websocket feed, different cadence, more coins
-   sharing the poller), re-check that `min_oracle_samples` still leaves margin
-   — the failure mode of getting this wrong is a bot that never trades and says
-   so only in the log.
+3. **The warmup threshold has ~22% headroom at the slowest rate observed
+   (0.64 polls/s), and that is the tightest number in this whole document.**
+   `min_oracle_samples: 60` needs the oracle loop to sustain roughly >0.5
+   polls/s. If the loop is ever changed — a websocket feed, a different
+   cadence, or (most likely, given the multicoin plan) **more coins sharing one
+   poller** — re-measure the achieved rate before shipping, because the failure
+   mode is a bot that never trades and says so only in the log. Concretely: at
+   6 coins on the current poller, check this first.
 4. **Live-mode populations differ.** Everything here is paper/backtest. A real
    taker changes who rests size against it; re-measure §1 after the first live
    trades.
+5. **Run `scripts/m4/mutation_check.py` whenever a guard is touched, and add a
+   mutation for every new guard.** It found three real defects here (§5.1) that
+   a green 214-test suite did not — including a check in code I had just
+   written. A guard without a mutation is a guard nobody has verified is
+   connected to anything.
+6. **`bankroll_usd: 1250` is a configured number, not a measured account
+   balance.** It is derived from `max_open_notional + per_event_cap_usd`. If
+   real capital is ever attached, set it to the actual bankroll — the daily
+   limit is 8% of whatever this says, so a stale value silently mis-sizes the
+   most important stop in the system.

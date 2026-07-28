@@ -28,7 +28,7 @@ their live-executability actually looks like.
   stub, not a silent Binance substitute).
   > **Operator note — coverage arithmetic.** Audits that counted `snipe eval`
   > log lines used to divide by 6 (one eval tick per second in the old `(0, 6]`
-  > window) to get "closes evaluated". With the `[2.0, 5.0]` band at a 1 Hz
+  > window) to get "closes evaluated". With the `[2.5, 5.0]` band at a 1 Hz
   > tick the divisor is now **3–4**. A ~45% drop in eval lines after this
   > change is the expected, intended effect — **not** a throttle.
 
@@ -69,7 +69,7 @@ statistic is `level.size / median(recent in-band ask-level sizes for this
 family)`; only levels inside `(price_min, price_max)` feed the reference,
 because a book that has already decided quotes ~24,000 shares at $0.01 and ~11
 shares at $0.50 and pooling them makes the statistic meaningless. The default
-is OFF **because the measurement refuted the hypothesis**: replaying shipped
+is OFF **because the measurement did not support the hypothesis**: replaying shipped
 close_snipe over 6,523 1h closes, levels larger than 5x the family median went
 44-for-44 at +38.1c/share while normal levels went 175-for-189 (92.6%) at
 +22.4c/share — at every threshold from 3x up, all 14 losing trades came from
@@ -130,7 +130,8 @@ like "alive with no signals".
 neuters each guard in turn (26 mutations), and requires the suite to go red
 for every one. A previous audit of this project found a guard that could be
 removed entirely with a green suite; this is the standing check that it cannot
-happen again. Current result: **23/23 killed**.
+happen again. Current result: **26/26 killed**. It has caught three real
+defects so far — see `../audit/M4_risk_guards.md` §5.1.
 
 ## Paper fill engine — the honesty guarantee
 
