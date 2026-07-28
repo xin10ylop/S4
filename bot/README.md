@@ -1,10 +1,45 @@
-# polybot — Polymarket BTC Up/Down trading bot
+# polybot — Polymarket crypto Up/Down trading bot
 
-Paper-trading bot (with a gated, real-order LIVE path) for Polymarket's BTC
+Paper-trading bot (with a gated, real-order LIVE path) for Polymarket's crypto
 Up/Down markets (5m/15m/1h/4h families). Built from the strategy research in
 `../docs/` (`03_final_report.md`, `04_executability_audit.md`,
 `05_clob_api_spec.md`) — read those for *why* these two strategies, and what
 their live-executability actually looks like.
+
+## Which coins trade — read this first
+
+The hourly family exists for **seven** coins (bitcoin, ethereum, solana, xrp,
+dogecoin, bnb, hype), all resolving on their own Binance `<COIN>/USDT` 1H
+candle. The bot understands all seven. **Only bitcoin may open a position.**
+
+| coin | mode | why |
+|---|---|---|
+| **bitcoin** | **FILL**, $250 clip | +13.32¢/share, 66 fills, t_day 3.30; the only coin whose edge survives every stress axis |
+| **ethereum** | **SHADOW** — signals logged, fills structurally impossible | +9.94¢ shipped but **+0.49¢ at a 3 s round trip**; its edge is smaller than one extra REST round trip |
+| solana, xrp, dogecoin, bnb | **off** | −7.7¢ / −5.9¢ / +1.5¢ (CI [−32.8,+30.0]) / −2.2¢ and a 2.19% late-flip rate |
+| hype | **off, deferred indefinitely** | resolves on USD-M **futures**, no spot pair, no reachable live feed; its +25.6¢ is an artifact of 13 fills |
+
+Three independent config lists control this, and collapsing them is how a recon
+result turns into a trade without anyone deciding it should:
+
+```yaml
+discovery.hourly_coins             # which coins are even looked up
+strategy.close_snipe.shadow_coins  # evaluated + logged, can NEVER fill
+strategy.close_snipe.allowed_coins # the only coins that may be filled
+```
+
+All three default to bitcoin-only when absent, so a pre-M5 `config.yaml` keeps
+exactly today's behaviour. `python -m polybot.main markets` prints the resolved
+mode per market. The full decision, per coin, with the deciding numbers, is in
+`../docs/09_multicoin_decision.md`.
+
+**Oracle routing fails closed.** `oracle.HOURLY_COIN_FEEDS` maps each coin to a
+verified `(symbol, venue)` — verified from each market's own `resolutionSource`
+and confirmed by a 7×7 cross-feed confusion matrix (diagonal 100.000%,
+off-diagonal 67.6–84.3%, so the check has real discriminative power). A coin
+with no entry gets **no oracle and no signal**; there is no default and no
+fallback anywhere on that path, because a fallback there means pricing ETH off
+BTC with no error raised.
 
 ## Strategies
 
@@ -21,8 +56,10 @@ their live-executability actually looks like.
   FAK order into a closed market); above `snipe_last_secs` the `fair` frozen
   at signal time carries too much unresolved BTC risk for the raised
   `per_event_cap_usd` (every large loss at a $250 clip came from `tau >= 5`).
-  1h uses Binance directly
-  (Binance *is* the market's resolution source, so there's no basis risk).
+  Each 1h market is priced off ITS OWN coin's Binance pair
+  (Binance *is* the market's resolution source, so there's no basis risk), routed
+  through `oracle.HOURLY_COIN_FEEDS` and failing closed for any coin without a
+  verified entry — see "Which coins trade" above.
   5m/15m/4h resolve on Chainlink and stay OFF until a Chainlink oracle is
   wired (see `polybot/oracle.py::ChainlinkOracle` — a documented, honest
   stub, not a silent Binance substitute).
@@ -49,14 +86,34 @@ that still clears the edge threshold, up to a per-event clip —
 `strategy.settle_sweep.cap_usd` (default $25) for settle_sweep, which is kept
 separate so a re-enabled settle_sweep cannot inherit the close_snipe clip.
 
-## Risk guards (M4)
+## Risk guards (M4 + M5)
 
-Five things bound risk here. Two are old (`per_event_cap_usd` per trade,
+Eight things bound risk here. Two are old (`per_event_cap_usd` per trade,
 `max_open_notional` across open positions); three were added in M4 and are
-documented with their measurements in `../audit/M4_risk_guards.md`. All are
-config-driven and backward compatible — a `config.yaml` written before M4
-still loads, and the two guards that matter default **ON** even if the file
-says nothing about them.
+documented with their measurements in `../audit/M4_risk_guards.md`; three more
+came with the multi-coin work and are documented in
+`../docs/09_multicoin_decision.md` §4. All are config-driven and backward
+compatible — a `config.yaml` written before M4 or M5 still loads, and every
+guard that matters defaults **ON** (or, for the new coin lists,
+bitcoin-only) even if the file says nothing about them.
+
+The three added in M5:
+
+- **Stale-book reject** (`strategy.close_snipe.max_book_age_s`, default **5.0
+  s**, ON). Refuses to lift a book whose *CLOB-reported* last-update stamp is
+  older than the bound — at the decision point **and** inside both the paper
+  and live fill paths. Calibration is the point: BTC's oldest fill book across
+  66 shipped-parameter fills was **2.2 s** (median 0.30 s), so this never fires
+  on the only coin that trades. What it would have caught: HYPE drew 93.6% of
+  its P&L and BNB 46.5% of its *negative* P&L from fills against books over 5 s
+  old. **Fails open** when the payload carries no timestamp — an upstream
+  schema change must not silently halt trading — and logs when it does.
+- **Fail-closed per-coin oracle routing + coin allowlist.** See the table
+  above. `allowed_coins` is enforced *independently of* `allowed_families`, so
+  widening the slug regex cannot by itself widen what trades.
+- **Shadow mode.** A coin in `shadow_coins` produces real signals and real
+  ledger rows but can never reach the fill dispatch. A coin listed in **both**
+  lists resolves to shadow — a config contradiction resolves the safe way.
 
 | Guard | Config | Default | Blocks |
 |---|---|---|---|
@@ -127,11 +184,29 @@ like "alive with no signals".
 ### Verifying the guards are real
 
 `python3 scripts/m4/mutation_check.py` copies `bot/` to a temp dir, deletes or
-neuters each guard in turn (26 mutations), and requires the suite to go red
+neuters each guard in turn (**54 mutations**), and requires the suite to go red
 for every one. A previous audit of this project found a guard that could be
 removed entirely with a green suite; this is the standing check that it cannot
-happen again. Current result: **26/26 killed**. It has caught three real
-defects so far — see `../audit/M4_risk_guards.md` §5.1.
+happen again.
+
+It has caught **five** real defects so far — three in
+`../audit/M4_risk_guards.md` §5.1, plus two found when the mutation set grew:
+
+- An independent verification pass wrote 36 mutations this project had not
+  written, and **8 survived a green 214-test suite** — five of them in
+  `config.py::risk_cfg`, silently handing a *pre-M4* `config.yaml` a disabled
+  or 10× looser circuit breaker. All eight are now in the set.
+- Writing the test that closes those found a live defect: `CircuitBreaker({})`
+  resolved **no daily limit at all**, because the bankroll/pct defaults lived
+  only in the config accessor. `risk.py` now carries second-line defaults.
+
+Current result: **54/54 killed**, zero survivors, zero stale anchors.
+
+A mutation whose anchor no longer matches the source is reported as a **STALE
+ANCHOR** and fails the run — silently not testing a guard is the same failure
+as not catching it. Pass label substrings (`mutation_check.py M5`) to re-run a
+subset; a partial run announces itself so its "N/N killed" cannot be mistaken
+for a full pass.
 
 ## Paper fill engine — the honesty guarantee
 
@@ -194,7 +269,7 @@ logs them.
 
 ```bash
 cd bot
-python3 -m pytest tests -q          # 212 tests
+python3 -m pytest tests -q          # 307 tests
 python3 -m unittest discover -s tests -v
 ```
 
@@ -315,15 +390,18 @@ bot/
     config.py                # config.yaml + env loading
     net.py                   # shared requests.Session + ssl.SSLContext (CA bundle handling)
     logging_setup.py         # stdout + rotating file logging
-    oracle.py                # BinanceOracle (data-api.binance.vision); ChainlinkOracle stub
-    polymarket.py             # gamma discovery + CLOB REST book/midpoint client
+    oracle.py                # BinanceOracle (spot + USD-M futures venues), the verified
+                             #   HOURLY_COIN_FEEDS table, ChainlinkOracle
+    polymarket.py             # gamma discovery (7-coin slug model), CLOB REST book +
+                             #   batched POST /books client
     strategy.py               # close_snipe / settle_sweep signal math (pure functions)
     fill_engine.py             # book-walking + latency-aware paper fill simulation
     execution.py               # PAPER/LIVE order router (gated real-order path)
     ledger.py                  # SQLite + CSV persistence, resolution, PnL/metrics
     status_server.py           # status.json writer + stdlib HTTP server (/status, /health)
     depth.py                   # M4 guard 1: rolling per-family depth reference statistic
-    risk.py                    # M4 guards 2+3: WarmupGate, CircuitBreaker
+    risk.py                    # M4 guards 2+3: WarmupGate, CircuitBreaker (+ M5 second-line
+                               #   breaker defaults)
     engine.py                  # orchestration: discovery/oracle/tick loops, thread pool
     ws_client.py               # optional, off-by-default WS market-data client
     main.py                    # CLI: run / status / markets / pnl / resume / halt

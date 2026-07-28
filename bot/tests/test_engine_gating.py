@@ -88,13 +88,17 @@ class StubClob:
 class StubLedger:
     def __init__(self):
         self.snipe_signals: List[object] = []
+        self.snipe_signal_meta: List[dict] = []
         self.settle_signals: List[tuple] = []
         self.open_notional = 0.0
         self.today_pnl = 0.0
         self.streak = 0
 
-    def record_snipe_signal(self, sig):
+    def record_snipe_signal(self, sig, extra_meta=None):
+        # M5: the engine attaches {coin, shadow, book_age_s}; capture it so
+        # tests can assert on the shadow tape's contents, not just its size.
         self.snipe_signals.append(sig)
+        self.snipe_signal_meta.append(dict(extra_meta or {}))
         return len(self.snipe_signals)
 
     def record_settle_signal(self, *a, **kw):

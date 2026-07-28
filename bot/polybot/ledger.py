@@ -110,11 +110,25 @@ class Ledger:
                 csv.writer(f).writerow(header)
 
     # --- signals -----------------------------------------------------------
-    def record_snipe_signal(self, sig: SnipeSignal) -> int:
+    def record_snipe_signal(self, sig: SnipeSignal,
+                             extra_meta: Optional[dict] = None) -> int:
+        """`extra_meta` (M5) carries the per-signal facts that are NOT derivable
+        from the signal itself and that any later analysis needs:
+
+          coin         - which underlying priced this (also in the slug, but a
+                         parsed field beats a parsed string)
+          shadow       - True when the coin is evaluated but structurally unable
+                         to fill. Without this the shadow tape is
+                         indistinguishable from a run of unlucky fill misses.
+          book_age_s   - the CLOB's own staleness at decision time. This is the
+                         statistic the verifier had to reconstruct from a vendor
+                         tape; recording it live makes it a first-class column.
+        """
         meta = {
             "tau_secs": sig.tau_secs, "s_t": sig.s_t, "s_open": sig.s_open,
             "sigma_1s": sig.sigma_1s,
         }
+        meta.update(extra_meta or {})
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO signals (ts, strategy, family, market_slug, side, token_id, "

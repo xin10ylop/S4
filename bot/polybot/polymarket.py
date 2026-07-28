@@ -270,6 +270,14 @@ def discover_markets(gamma: GammaClient, config: Config) -> Dict[str, Market]:
                     found[mkt.slug] = mkt
 
     # --- 2. broad scan fallback ----------------------------------------------
+    # NB: the coin filter below is load-bearing after M5. Widening _HOURLY_RE to
+    # seven coins made this scan pick up every coin's hourly markets regardless
+    # of `discovery.hourly_coins` — observed live on 2026-07-28, which pulled in
+    # bnb/hype/solana/xrp/dogecoin. Nothing unsafe happened (the coin allowlist
+    # refused them all, loudly), but the bot was tracking, cache-warming and
+    # tick-scanning markets it can never price, let alone trade. Discovery
+    # breadth must come from ONE place, and that place is `hourly_coins`.
+    wanted_coins = set(config.hourly_coins())
     events_limit = int(disc_cfg.get("events_limit", 200))
     for offset in range(0, events_limit, 100):
         page = gamma.get_events_page(closed=False, limit=100, offset=offset,
@@ -281,7 +289,10 @@ def discover_markets(gamma: GammaClient, config: Config) -> Dict[str, Market]:
                 # event-embedded markets sometimes omit fields present on the
                 # full /markets record; merge what's needed.
                 slug = m.get("slug") or ev.get("slug", "")
-                if not (_HOURLY_RE.match(slug) or _SHORT_RE.match(slug)):
+                hm = _HOURLY_RE.match(slug)
+                if not (hm or _SHORT_RE.match(slug)):
+                    continue
+                if hm and hm.group("coin") not in wanted_coins:
                     continue
                 if slug in found:
                     continue

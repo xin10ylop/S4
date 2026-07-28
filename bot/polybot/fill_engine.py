@@ -161,6 +161,12 @@ def walk_asks(
     return result
 
 
+# Clock skew beyond this magnitude is reported, once per process, as an
+# operational fault. See book_is_stale for why it matters.
+_SKEW_WARN_SECS = 0.5
+_skew_warned = False
+
+
 def book_is_stale(book: Optional[OrderBook], max_book_age_s: Optional[float],
                   now: Optional[float] = None) -> bool:
     """True iff the CLOB's own last-update stamp for `book` is older than the
@@ -169,13 +175,45 @@ def book_is_stale(book: Optional[OrderBook], max_book_age_s: Optional[float],
     Fails OPEN (returns False) when the guard is off, the book is missing, or
     the payload carried no timestamp — an upstream schema change must not
     silently halt all trading. See engine._book_too_stale for the full argument.
+
+    CLOCK SKEW. `age = local_now - clob_timestamp`, so it inherits any offset
+    between this host's clock and the CLOB's. Observed live on 2026-07-28: ages
+    of **-1.05 s**, i.e. this sandbox's clock is at least a second behind the
+    exchange. Two consequences, and only one of them is dangerous:
+
+      * clock BEHIND (negative ages): the guard under-blocks by the offset.
+        Safe direction, and it is what was actually observed.
+      * clock AHEAD: every age inflates by the offset, and a host drifting a few
+        seconds ahead would make EVERY book look stale and silently halt all
+        trading — the same class of failure as the warmup deadlock M4 found.
+
+    A negative age is physically impossible, so it is reported, and clamped to 0
+    for the comparison. Be clear about what that clamp is worth: for any
+    positive `max_book_age_s` it is a **no-op** — a negative age never exceeds a
+    positive bound either way — and the mutation checker correctly flagged a
+    mutation removing it as unkillable. It stays because it makes the intent
+    explicit and holds if the comparison is ever changed; it is not a guard.
+    **The behaviour that protects anything here is the warning**, which is what
+    the checker mutates. And the warning cannot fix a clock running AHEAD —
+    nothing read from a single timestamp can — so **the production host must run
+    NTP**, and this is the line that says so out loud.
     """
     if book is None or max_book_age_s is None or max_book_age_s <= 0:
         return False
     age = book.age_secs(now)
     if age is None:
         return False
-    return age > float(max_book_age_s)
+    if age < -_SKEW_WARN_SECS:
+        global _skew_warned
+        if not _skew_warned:
+            _skew_warned = True
+            log.warning(
+                "CLOCK SKEW: book %s reports an age of %.2fs, which is impossible — this "
+                "host's clock is at least %.2fs BEHIND the CLOB. The stale-book guard is "
+                "under-blocking by roughly that much. Harmless in this direction, but a "
+                "clock running AHEAD would make every book look stale and halt trading: "
+                "run NTP on the production host.", book.token_id, age, -age)
+    return max(0.0, age) > float(max_book_age_s)
 
 
 @dataclass

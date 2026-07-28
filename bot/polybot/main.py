@@ -42,20 +42,41 @@ def cmd_markets(args: argparse.Namespace) -> int:
         return 1
 
     now = time.time()
-    rows = sorted(markets.values(), key=lambda m: m.close_ts)
+    rows = sorted(markets.values(), key=lambda m: (m.close_ts, m.coin))
+    allowed = set(config.allowed_coins())
+    shadow = set(config.shadow_coins())
+    allowed_fams = set(config.snipe_cfg.get("allowed_families", ["1h"]))
     fam_width = 4
+    coin_width = max(max(len(m.coin) for m in rows), 4) + 1
     slug_width = max(len(m.slug) for m in rows) + 2
-    header = f"{'FAM':<{fam_width}} {'SLUG':<{slug_width}} {'CLOSES (UTC)':<21} {'T-CLOSE':>10} {'ACCEPT':>7} {'CLOSED':>7}"
+    header = (f"{'FAM':<{fam_width}} {'COIN':<{coin_width}} {'MODE':<9} "
+              f"{'SLUG':<{slug_width}} {'CLOSES (UTC)':<21} {'T-CLOSE':>10} "
+              f"{'ACCEPT':>7} {'CLOSED':>7}")
     print(header)
     print("-" * len(header))
     for m in rows:
         t_close = m.close_ts - now
         sign = "-" if t_close < 0 else ""
         t_str = f"{sign}{abs(int(t_close))}s"
-        print(f"{m.family:<{fam_width}} {m.slug:<{slug_width}} "
+        # MODE makes the safety state visible without reading config.yaml, and
+        # must reflect BOTH gates: a market is only fillable if its family is in
+        # allowed_families AND its coin is in allowed_coins. Showing the coin
+        # gate alone would label every 5m/15m/4h BTC market "FILL" when the
+        # family allowlist blocks all of them.
+        if m.family not in allowed_fams:
+            mode = "off:fam"
+        elif m.coin in shadow:
+            mode = "SHADOW"
+        elif m.coin in allowed:
+            mode = "FILL"
+        else:
+            mode = "off:coin"
+        print(f"{m.family:<{fam_width}} {m.coin:<{coin_width}} {mode:<9} "
+              f"{m.slug:<{slug_width}} "
               f"{m.end_date.strftime('%Y-%m-%d %H:%M:%S'):<21} {t_str:>10} "
               f"{str(m.accepting_orders):>7} {str(m.closed):>7}")
-    print(f"\n{len(rows)} markets discovered.")
+    print(f"\n{len(rows)} markets discovered "
+          f"(fill={sorted(allowed)} shadow={sorted(shadow)}).")
     return 0
 
 
@@ -95,6 +116,14 @@ def cmd_status(args: argparse.Namespace) -> int:
                   f"oracle_samples={wu.get('oracle_samples')}/"
                   f"{wu.get('required_oracle_samples')}  "
                   f"uptime={wu.get('uptime_secs')}/{wu.get('required_uptime_secs')}s")
+            # M5: warmup is per-oracle, so show it per-coin. A shared poller
+            # that starves one coin's buffer is invisible in the aggregate.
+            for coin, c in sorted((wu.get("coins") or {}).items()):
+                mode = ("FILL" if c.get("may_fill")
+                        else "SHADOW" if c.get("shadow") else "off")
+                print(f"           {coin:<9} {c.get('symbol')}@{c.get('venue')} "
+                      f"{mode:<6} samples={c.get('oracle_samples')} "
+                      f"ready={c.get('ready')} cap=${c.get('cap_usd')}")
         r = g.get("risk") or {}
         if r:
             lim = r.get("daily_loss_limit_usd")

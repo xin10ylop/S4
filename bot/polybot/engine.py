@@ -20,7 +20,7 @@ from typing import Dict, Optional, Set
 from .config import Config
 from .depth import DepthTracker, max_level_shares
 from .execution import ExecutionRouter
-from .fill_engine import FillAttempt
+from .fill_engine import FillAttempt, book_is_stale
 from .ledger import Ledger
 from .logging_setup import get_logger
 from .oracle import BinanceOracle, ChainlinkOracle, coin_feed
@@ -48,6 +48,13 @@ class Engine:
         # with no entry here gets NO oracle and therefore never trades; see
         # `_oracle_for`, which returns None rather than substituting BTC.
         self.coin_oracles: Dict[str, BinanceOracle] = {}
+        # Resolved ONCE at construction, for two reasons. (1) These are consulted
+        # on every evaluation tick for every tracked market, and rebuilding the
+        # lists there is pure garbage. (2) `Config.shadow_coins()` logs a warning
+        # when a coin appears in both lists — a config error worth saying once at
+        # boot, not several times a second forever.
+        self._allowed_coins = tuple(config.allowed_coins())
+        self._shadow_coins = tuple(config.shadow_coins())
         self._build_coin_oracles()
         # The Chainlink oracle is only constructed when a family that resolves
         # on it actually has a strategy enabled. With the shipped config
@@ -114,7 +121,7 @@ class Engine:
         an oracle — a discovered-but-unpriced coin simply never produces a
         signal."""
         seen, out = set(), []
-        for c in list(self.config.allowed_coins()) + list(self.config.shadow_coins()):
+        for c in list(self._allowed_coins) + list(self._shadow_coins):
             if c not in seen:
                 seen.add(c)
                 out.append(c)
@@ -183,13 +190,13 @@ class Engine:
         # — which coins are discovered, which may fill, which are shadow-only,
         # and the exact symbol/venue each one is priced off.
         log.info("M5 coins: discover=%s allowed(fill)=%s shadow(no fill)=%s",
-                 self.config.hourly_coins(), self.config.allowed_coins(),
-                 self.config.shadow_coins())
+                 self.config.hourly_coins(), list(self._allowed_coins),
+                 list(self._shadow_coins))
         for coin, oracle in self._binance_oracles().items():
             log.info("M5 oracle: coin=%-9s symbol=%-9s venue=%-13s cap_usd=%.0f may_fill=%s",
                      coin, oracle.symbol, oracle.venue, self.config.coin_cap_usd(coin),
-                     coin in self.config.allowed_coins()
-                     and coin not in self.config.shadow_coins())
+                     coin in self._allowed_coins
+                     and coin not in self._shadow_coins)
         for coin in self._priced_coins():
             if coin != "bitcoin" and coin not in self.coin_oracles:
                 log.error("M5 oracle MISSING for coin=%s — it is configured for pricing but "
@@ -538,6 +545,11 @@ class Engine:
         `timestamp` field, so treating "field absent" as "too stale" would let
         an upstream schema change silently stop all trading. The absence is
         logged once per occurrence instead.
+
+        The comparison itself is delegated to `fill_engine.book_is_stale` so the
+        decision point and the two fill paths cannot drift apart — including its
+        clock-skew clamp, which matters because live books were observed
+        reporting NEGATIVE ages of -1.05 s on 2026-07-28.
         """
         limit = self.config.max_book_age_s
         if limit is None or book is None:
@@ -547,7 +559,7 @@ class Engine:
             log.warning("book %s carries no CLOB timestamp — age guard cannot apply "
                         "(failing OPEN)", book.token_id)
             return None
-        return age if age > limit else None
+        return age if book_is_stale(book, limit, now) else None
 
     # --------------------------------------------------------- close_snipe
     def _maybe_snipe(self, market: Market, now: float) -> None:
@@ -574,16 +586,16 @@ class Engine:
         # item 4). A coin must be in `allowed_coins` (fills) or `shadow_coins`
         # (evaluate + log, never fill) to get any further.
         coin = getattr(market, "coin", None)
-        may_fill = coin in self.config.allowed_coins()
-        is_shadow = coin in self.config.shadow_coins()
+        may_fill = coin in self._allowed_coins
+        is_shadow = coin in self._shadow_coins
         if not (may_fill or is_shadow):
             if market.slug not in self._snipe_coin_warned:
                 self._snipe_coin_warned.add(market.slug)
                 log.warning("close_snipe: coin %r (%s) is NOT in "
                             "strategy.close_snipe.allowed_coins=%s nor shadow_coins=%s — "
                             "refusing to trade it. See docs/09_multicoin_decision.md.",
-                            coin, market.slug, self.config.allowed_coins(),
-                            self.config.shadow_coins())
+                            coin, market.slug, list(self._allowed_coins),
+                            list(self._shadow_coins))
             return
         # A shadow coin that also happens to be allowed is resolved to SHADOW by
         # Config.shadow_coins(); re-assert it here so the safe reading is local
@@ -654,7 +666,16 @@ class Engine:
             return
 
         self.snipe_done.add(market.slug)
-        signal_id = self.ledger.record_snipe_signal(sig)
+        book_at_signal = book_up if sig.side == "up" else book_down
+        # Book age on WALL clock, not on the tick's `now`, so the recorded value
+        # is the same quantity `_book_too_stale` gates on. An audit of "why was
+        # this not blocked?" must not have to reconcile two different clocks.
+        book_age = book_at_signal.age_secs() if book_at_signal is not None else None
+        signal_id = self.ledger.record_snipe_signal(sig, extra_meta={
+            "coin": coin,
+            "shadow": not may_fill,
+            "book_age_s": (round(book_age, 3) if book_age is not None else None),
+        })
         log.info("SIGNAL close_snipe %s coin=%s side=%s fair=%.4f ask=%.4f edge=%.4f tau=%.1fs",
                   market.slug, coin, sig.side, sig.fair, sig.ask, sig.edge, sig.tau_secs)
         self.status.add_event("signal", f"close_snipe {market.slug} side={sig.side} "
@@ -677,8 +698,6 @@ class Engine:
                             "will ever be dispatched for it.", coin)
             log.info("SHADOW (no fill) %s coin=%s edge=%.4f", market.slug, coin, sig.edge)
             return
-
-        book_at_signal = book_up if sig.side == "up" else book_down
 
         # ---- M5 BOOK-AGE GUARD at the decision point. See `_book_too_stale`.
         stale_age = self._book_too_stale(book_at_signal)
@@ -830,9 +849,9 @@ class Engine:
                     "venue": feed[1] if feed else None,
                     "oracle_samples": st.samples,
                     "ready": st.ready,
-                    "may_fill": coin in self.config.allowed_coins()
-                                and coin not in self.config.shadow_coins(),
-                    "shadow": coin in self.config.shadow_coins(),
+                    "may_fill": (coin in self._allowed_coins
+                                 and coin not in self._shadow_coins),
+                    "shadow": coin in self._shadow_coins,
                     "cap_usd": self.config.coin_cap_usd(coin),
                 }
             wud["coins"] = per_coin

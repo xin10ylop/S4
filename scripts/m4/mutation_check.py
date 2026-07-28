@@ -7,7 +7,9 @@ with a green suite. This script is the standing check that it cannot happen
 again. Every mutation is applied to a COPY of bot/ in a temp dir; the real tree
 is never modified.
 
-Usage:  python3 scripts/m4/mutation_check.py
+Usage:  python3 scripts/m4/mutation_check.py            # all mutations
+        python3 scripts/m4/mutation_check.py M5 V8      # only labels matching
+                                                        # any of these substrings
 """
 from __future__ import annotations
 
@@ -137,10 +139,12 @@ MUTATIONS = [
      "            if not dq or len(dq) < self.min_samples:\n                return None",
      "            if not dq:\n                return None"),
 
+    # Anchor re-pinned in M5: `max_book_age_s=max_book_age_s` was appended to
+    # this call, which moved the old anchor's closing paren.
     ("G1 filter not threaded into the live order path",
      "polybot/execution.py",
-     "                                           max_level_shares=max_level_shares,\n                                           anomalous_mode=anomalous_mode)",
-     "                                           )"),
+     "                                           max_level_shares=max_level_shares,\n                                           anomalous_mode=anomalous_mode,\n                                           max_book_age_s=max_book_age_s)",
+     "                                           max_book_age_s=max_book_age_s)"),
 
     ("G1 engine never computes a level ceiling",
      "polybot/engine.py",
@@ -270,8 +274,21 @@ MUTATIONS = [
 
     ("M5 stale-book predicate always says fresh",
      "polybot/fill_engine.py",
-     "    return age > float(max_book_age_s)",
+     "    return max(0.0, age) > float(max_book_age_s)",
      "    return False"),
+
+    # NOT a mutation: `max(0.0, age) > L` and `age > L` are IDENTICAL for every
+    # real `age` whenever L > 0, and the function returns early when L <= 0. The
+    # clamp is therefore a no-op, and a mutation removing it can never be
+    # killed — which the checker duly reported as a SURVIVOR on its first run.
+    # The behaviour that actually protects anything is the skew WARNING, so that
+    # is what gets mutated instead. Recorded here rather than deleted silently,
+    # because "we removed the mutation" and "we tested the guard" are different
+    # sentences.
+    ("M5 clock-skew warning never fires (operator cannot see a bad clock)",
+     "polybot/fill_engine.py",
+     "    if age < -_SKEW_WARN_SECS:",
+     "    if False:"),
 
     ("M5 stale-book guard removed from the decision point",
      "polybot/engine.py",
@@ -307,6 +324,18 @@ def run_suite(bot_dir: Path):
 
 
 def main() -> int:
+    # Optional label filter. A partial run is clearly announced so its
+    # "N/N killed" line can never be mistaken for a full pass.
+    filters = [a for a in sys.argv[1:] if not a.startswith("-")]
+    mutations = MUTATIONS
+    if filters:
+        mutations = [m for m in MUTATIONS if any(f in m[0] for f in filters)]
+        print(f"PARTIAL RUN: {len(mutations)} of {len(MUTATIONS)} mutations match "
+              f"{filters}\n")
+        if not mutations:
+            print("no mutations matched the filter")
+            return 2
+
     base = run_suite(BOT)
     if base.returncode != 0:
         print("BASELINE SUITE IS ALREADY RED — fix that first")
@@ -314,8 +343,8 @@ def main() -> int:
         return 2
     print(f"baseline: GREEN  ({base.stdout.strip().splitlines()[-1]})\n")
 
-    survived, killed = [], []
-    for label, rel, old, new in MUTATIONS:
+    survived, killed, stale = [], [], []
+    for label, rel, old, new in mutations:
         with tempfile.TemporaryDirectory() as td:
             dst = Path(td) / "bot"
             shutil.copytree(BOT, dst, ignore=shutil.ignore_patterns(
@@ -323,8 +352,12 @@ def main() -> int:
             target = dst / rel
             src = target.read_text()
             if old not in src:
-                print(f"  !! SKIP (anchor not found): {label}  [{rel}]")
-                survived.append(label + "  (anchor missing)")
+                # A stale anchor is NOT a pass. It means this guard is silently
+                # no longer being mutated at all — the exact rot this script
+                # exists to prevent — so it is reported separately and fails
+                # the run just as a survivor does.
+                print(f"  !! STALE ANCHOR (mutation never applied): {label}  [{rel}]")
+                stale.append(f"{label}  [{rel}]")
                 continue
             target.write_text(src.replace(old, new, 1))
             res = run_suite(dst)
@@ -337,14 +370,23 @@ def main() -> int:
                 print(f"  killed    {label}   ({first[0] if first else tail})")
                 killed.append(label)
 
-    print(f"\n{len(killed)}/{len(MUTATIONS)} mutations killed by the suite")
+    print(f"\n{len(killed)}/{len(mutations)} mutations killed by the suite")
+    rc = 0
+    if stale:
+        print(f"STALE ANCHORS ({len(stale)}) — these mutations did not run at all; "
+              f"re-pin them against the current source:")
+        for s in stale:
+            print("  - " + s)
+        rc = 1
     if survived:
-        print("SURVIVORS (each is an untested guard):")
+        print(f"SURVIVORS ({len(survived)}) — each is an untested guard:")
         for s in survived:
             print("  - " + s)
-        return 1
-    print("All guard mutations are caught by the test suite.")
-    return 0
+        rc = 1
+    if rc == 0:
+        print(f"All {len(mutations)} guard mutations were applied and all were caught "
+              f"by the test suite.")
+    return rc
 
 
 if __name__ == "__main__":

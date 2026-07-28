@@ -18,13 +18,12 @@ See docs/09_multicoin_decision.md for why only bitcoin may fill.
 """
 from __future__ import annotations
 
-import copy
 import datetime as dt
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -40,7 +39,7 @@ from polybot.polymarket import (HOURLY_COINS, BookLevel, ClobClientREST, OrderBo
                                  _HOURLY_RE, _hourly_slug, _parse_market)
 
 from tests.test_engine_gating import (CONFIG_YAML, FakeMarket, StubBinance, StubClob,
-                                       StubExecutor, StubLedger, _make_engine, warm)
+                                       StubExecutor, StubLedger, warm)
 
 ET = ZoneInfo("America/New_York")
 
@@ -432,6 +431,44 @@ class TestShadowMode(unittest.TestCase):
         self.assertEqual(len(self.eng.ledger.snipe_signals), 1,
                          "shadow mode must still produce the evidence it exists for")
 
+    def test_the_signal_is_tagged_coin_and_shadow(self):
+        """Without these fields the shadow tape is indistinguishable from a run
+        of unlucky fill misses, and the whole mode is pointless."""
+        self.eng._maybe_snipe(FakeMarket(slug="e", coin="ethereum",
+                                          close_ts=self.now + 3.0), self.now)
+        meta = self.eng.ledger.snipe_signal_meta[0]
+        self.assertEqual(meta["coin"], "ethereum")
+        self.assertTrue(meta["shadow"])
+
+    def test_a_fillable_signal_is_tagged_not_shadow(self):
+        self.eng._maybe_snipe(FakeMarket(slug="b", coin="bitcoin",
+                                          close_ts=self.now + 3.0), self.now)
+        meta = self.eng.ledger.snipe_signal_meta[0]
+        self.assertEqual(meta["coin"], "bitcoin")
+        self.assertFalse(meta["shadow"])
+
+    def test_book_age_is_recorded_on_every_signal(self):
+        """The staleness statistic the verifier had to reconstruct from a vendor
+        tape is now a first-class column, recorded live."""
+        class _AgedClob(StubClob):
+            def get_book(self_inner, token_id):
+                b = super().get_book(token_id)
+                import time
+                b.book_ts = time.time() - 1.25
+                return b
+
+        self.eng.clob = _AgedClob()
+        self.eng._maybe_snipe(FakeMarket(slug="b", coin="bitcoin",
+                                          close_ts=self.now + 3.0), self.now)
+        age = self.eng.ledger.snipe_signal_meta[0]["book_age_s"]
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 0.0)
+
+    def test_book_age_is_None_when_unmeasurable_not_zero(self):
+        self.eng._maybe_snipe(FakeMarket(slug="b", coin="bitcoin",
+                                          close_ts=self.now + 3.0), self.now)
+        self.assertIsNone(self.eng.ledger.snipe_signal_meta[0]["book_age_s"])
+
     def test_shadow_coin_NEVER_dispatches_a_fill(self):
         self.eng._maybe_snipe(FakeMarket(slug="e", coin="ethereum",
                                           close_ts=self.now + 3.0), self.now)
@@ -696,6 +733,21 @@ class TestStaleBookPredicate(unittest.TestCase):
     def test_missing_book_is_not_stale(self):
         self.assertFalse(book_is_stale(None, 5.0))
 
+    def test_a_negative_age_from_clock_skew_is_never_stale(self):
+        """Observed live 2026-07-28: this host's clock reads ~1.05s BEHIND the
+        CLOB, so books report impossible negative ages. A negative age must
+        clamp to 0, never wrap into a comparison that blocks trading."""
+        self.assertFalse(book_is_stale(_book(age=-1.05), 5.0))
+        self.assertFalse(book_is_stale(_book(age=-600.0), 5.0))
+
+    def test_clock_skew_is_reported_once(self):
+        import polybot.fill_engine as fe
+        fe._skew_warned = False
+        with self.assertLogs("polybot.fill_engine", level="WARNING") as cm:
+            book_is_stale(_book(age=-1.05), 5.0)
+        self.assertTrue(any("CLOCK SKEW" in m for m in cm.output))
+        fe._skew_warned = False
+
 
 class TestStaleBookBlocksFills(unittest.TestCase):
     def setUp(self):
@@ -942,6 +994,63 @@ class TestM5WeakensNothing(unittest.TestCase):
         for fam in ("5m", "15m", "4h"):
             self.assertFalse(self.raw["families"][fam]["close_snipe"])
             self.assertFalse(self.raw["families"][fam]["settle_sweep"])
+
+    def test_discovery_scan_respects_hourly_coins(self):
+        """REGRESSION, found in the live dry run of 2026-07-28.
+
+        `discover_markets` has two sources: deterministic slug construction
+        (which loops over `hourly_coins`) and a broad `/events` scan (which
+        pattern-matches). Widening `_HOURLY_RE` to seven coins made the SECOND
+        source ingest every coin regardless of the config, and the live dry run
+        duly tracked bnb, hype, solana, xrp and dogecoin markets. Nothing unsafe
+        happened — the coin allowlist refused all of them, loudly — but
+        discovery breadth must come from one place.
+        """
+        from polybot.polymarket import discover_markets
+
+        class _Gamma:
+            """Slug lookups miss; the events page offers all seven coins."""
+
+            def get_market_by_slug(self, slug, closed=None):
+                return None
+
+            def get_events_page(self, closed, limit, offset, order, ascending):
+                if offset:
+                    return []
+                return [{"markets": [{
+                    "slug": f"{c}-up-or-down-july-15-2026-3pm-et",
+                    "clobTokenIds": '["U","D"]',
+                    "endDate": "2026-07-15T20:00:00Z",
+                    "startDate": "2026-07-13T20:00:00Z",
+                } for c in HOURLY_COINS]}]
+
+        raw = _raw()
+        raw["discovery"]["hourly_coins"] = ["bitcoin", "ethereum"]
+        found = discover_markets(_Gamma(), Config(raw=raw, path=CONFIG_YAML))
+        self.assertEqual(sorted(m.coin for m in found.values()),
+                         ["bitcoin", "ethereum"])
+
+    def test_discovery_scan_still_finds_the_short_btc_families(self):
+        """The coin filter must not accidentally drop btc-updown-* slugs, which
+        carry no coin token at all."""
+        from polybot.polymarket import discover_markets
+
+        class _Gamma:
+            def get_market_by_slug(self, slug, closed=None):
+                return None
+
+            def get_events_page(self, closed, limit, offset, order, ascending):
+                if offset:
+                    return []
+                return [{"markets": [{
+                    "slug": "btc-updown-5m-1785000000",
+                    "clobTokenIds": '["U","D"]',
+                    "endDate": "2026-07-15T20:05:00Z",
+                    "startDate": "2026-07-15T20:00:00Z",
+                }]}]
+
+        found = discover_markets(_Gamma(), Config(raw=_raw(), path=CONFIG_YAML))
+        self.assertEqual([m.family for m in found.values()], ["5m"])
 
     def test_discovery_list_never_exceeds_what_can_be_priced(self):
         """A coin discovered but not priced is only wasted REST calls, but it
