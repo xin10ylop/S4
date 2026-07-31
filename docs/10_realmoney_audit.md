@@ -390,7 +390,8 @@ call-site wiring. `TestPlaceLiveOrder` now exercises the whole function against 
 py-clob-client: full fill, partial fill, zero match, rejection, unknown schema, below-minimum, and
 stale book. **The live order path has real tests for the first time.**
 
-Suite: **307 → 336 passing.** Mutation checker: 54 → 69 checks.
+Suite: **307 → 336 passing.** Mutation checker: 54 → 68 checks, **68/68 killed, zero survivors,
+zero stale anchors** — every guard above is provably load-bearing, not decorative.
 
 ---
 
