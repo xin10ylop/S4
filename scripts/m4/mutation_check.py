@@ -143,8 +143,8 @@ MUTATIONS = [
     # this call, which moved the old anchor's closing paren.
     ("G1 filter not threaded into the live order path",
      "polybot/execution.py",
-     "                                           max_level_shares=max_level_shares,\n                                           anomalous_mode=anomalous_mode,\n                                           max_book_age_s=max_book_age_s)",
-     "                                           max_book_age_s=max_book_age_s)"),
+     "                                           max_level_shares=max_level_shares,\n                                           anomalous_mode=anomalous_mode,\n                                           max_book_age_s=max_book_age_s,\n                                           order_min_size=order_min_size)",
+     "                                           max_book_age_s=max_book_age_s,\n                                           order_min_size=order_min_size)"),
 
     ("G1 engine never computes a level ceiling",
      "polybot/engine.py",

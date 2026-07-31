@@ -380,7 +380,17 @@ signal shape the shipped bot must now refuse. The fixture, not the gate, was wro
 moved to +$20 on $100k (|z| ≈ 1.2), inside the band that actually carries the edge. This is a
 reminder that the old tests would have passed no matter how bad the high-|z| behaviour got.
 
-Suite: **307 → 328 passing.** Mutation checker: 54 → 69 checks.
+**The mutation checker caught me over-claiming.** My first pass added the five fixes above with 22
+new tests and the suite went green — but running `scripts/m4/mutation_check.py` showed **3 of the
+new guards survived deletion**: partial fills not truncated, a zero-match FAK recorded as a fill,
+and the exchange minimum not enforced. All three live in `_place_live_order`, which the independent
+audit had separately flagged as *"the only code path that spends real money and has no test at
+all"* — my new tests covered the helpers (`_parse_filled_size`, `truncated_to_shares`) but never the
+call-site wiring. `TestPlaceLiveOrder` now exercises the whole function against a stubbed
+py-clob-client: full fill, partial fill, zero match, rejection, unknown schema, below-minimum, and
+stale book. **The live order path has real tests for the first time.**
+
+Suite: **307 → 336 passing.** Mutation checker: 54 → 69 checks.
 
 ---
 
