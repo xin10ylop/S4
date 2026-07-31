@@ -46,10 +46,21 @@ class FakeMarket:
 
 
 class StubBinance:
-    """Deterministic oracle: price well above the window open, modest vol, so
-    fair_up saturates at fair_cap and a 0.50 ask is a clear mispricing."""
+    """Deterministic oracle: price above the window open with modest vol, so
+    fair_up is confidently (but not absurdly) UP and a 0.50 ask is a clear
+    mispricing.
 
-    def __init__(self, now: float, s_t: float = 101_000.0, s_open: float = 100_000.0,
+    The default used to be s_t=101_000 against s_open=100_000 — a 1% BTC move
+    with 3 seconds left, which at sigma=1e-4 is |z| ~ 57. That is a ~57-sigma
+    event, and it is precisely the shape `max_abs_z` now vetoes (see
+    docs/10_realmoney_audit.md §4: |z|>5 fills won 57% against a 77%
+    break-even). Every gating test written against it was therefore asserting
+    on a signal the shipped bot must refuse to take. The default is now +$20
+    on $100k => |z| ~ 1.2 at tau=3, inside the band that actually carries the
+    edge. Tests that specifically want the vetoed regime pass s_t explicitly.
+    """
+
+    def __init__(self, now: float, s_t: float = 100_020.0, s_open: float = 100_000.0,
                  staleness: float = 0.0, sigma: float = 1e-4, n_samples: int = 120):
         self._pt = PricePoint(ts=now - staleness, price=s_t)
         self._s_open = s_open
@@ -319,6 +330,82 @@ class TestSizingAndSettleWiring(_EngineTestBase):
             *eng.executor.submissions[0][1], **eng.executor.submissions[0][2]).arguments
         self.assertEqual(bound["cap_usd"], 25.0)
         self.assertLess(bound["cap_usd"], float(eng.config.sizing_cfg["per_event_cap_usd"]))
+
+
+class TestOrphanedPositionRecovery(_EngineTestBase):
+    """docs/10_realmoney_audit.md §7. `known_markets` is populated ONLY by
+    discovery, and discovery asks gamma with `closed` omitted — which gamma
+    treats as closed=false. So a position filled just before a restart, whose
+    window closed while the bot was down, is never rediscovered. Before the fix
+    `_check_resolutions` skipped it forever: its cost stayed in
+    total_open_notional() eating the global cap, and its realised P&L never
+    reached the daily breaker or the consecutive-loss brake.
+    """
+
+    RAW = {
+        "slug": "bitcoin-up-or-down-july-15-2026-3pm-et",
+        "question": "Bitcoin Up or Down?",
+        "conditionId": "0xcond",
+        "clobTokenIds": '["UP", "DOWN"]',
+        "endDate": "2026-07-15T19:00:00Z",
+        "startDate": "2026-07-13T19:00:00Z",
+        "closed": True, "active": False, "acceptingOrders": False,
+        "outcomePrices": '["1", "0"]',
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.slug = self.RAW["slug"]
+        self.engine.ledger.unresolved = [self.slug]
+        self.engine.ledger.unresolved_markets = lambda: self.engine.ledger.unresolved
+        self.engine.known_markets.pop(self.slug, None)
+        self.gamma_calls = []
+
+        def fake_get(slug, closed=None):
+            self.gamma_calls.append((slug, closed))
+            return dict(self.RAW) if closed is True else None
+
+        self.engine.gamma.get_market_by_slug = fake_get
+        self.resolved = []
+        self.engine._attempt_resolution = lambda m, now, t: self.resolved.append(m.slug)
+
+    def test_orphan_is_recovered_and_resolved(self):
+        now = 1_784_142_000.0 + 3600.0   # comfortably past the window close
+        self.engine._check_resolutions(now)
+        self.assertIn(self.slug, self.engine.known_markets,
+                      "orphaned market must be rebuilt into known_markets")
+        self.assertEqual(self.resolved, [self.slug],
+                         "recovered orphan must actually be resolved, not just cached")
+        self.assertIn((self.slug, True), self.gamma_calls,
+                      "recovery MUST query gamma with closed=True — closed=None returns "
+                      "an empty list for resolved markets, which is the whole bug")
+
+    def test_recovery_happens_once_not_every_tick(self):
+        now = 1_784_142_000.0 + 3600.0
+        self.engine._check_resolutions(now)
+        n_after_first = len(self.gamma_calls)
+        self.engine._check_resolutions(now + 0.5)
+        self.assertEqual(len(self.gamma_calls), n_after_first,
+                         "a recovered market is cached; do not re-fetch it every tick")
+
+    def test_unrecoverable_slug_is_rate_limited(self):
+        """A slug gamma cannot return must not spin one request per tick."""
+        self.engine.gamma.get_market_by_slug = lambda slug, closed=None: (
+            self.gamma_calls.append((slug, closed)) or None)
+        now = 1_784_142_000.0 + 3600.0
+        for i in range(50):
+            self.engine._check_resolutions(now + i * 0.1)   # 5 s of ticks
+        poll = float(self.engine.config.resolution_cfg["gamma_poll_secs"])
+        self.assertLessEqual(len(self.gamma_calls), 5.0 / poll + 2,
+                             f"expected rate-limiting to ~1 call per {poll}s, "
+                             f"got {len(self.gamma_calls)} in 5s")
+
+    def test_gamma_failure_does_not_crash_the_resolution_loop(self):
+        def boom(slug, closed=None):
+            raise RuntimeError("gamma 503")
+        self.engine.gamma.get_market_by_slug = boom
+        self.engine._check_resolutions(1_784_142_000.0 + 3600.0)   # must not raise
+        self.assertEqual(self.resolved, [])
 
 
 if __name__ == "__main__":

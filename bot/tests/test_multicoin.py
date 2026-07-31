@@ -366,7 +366,7 @@ class TestCoinAllowlist(unittest.TestCase):
 
     def _ready(self, eng, coin):
         eng.binance = StubBinance(self.now)
-        eng.coin_oracles[coin] = StubBinance(self.now, s_t=3030.0, s_open=3000.0)
+        eng.coin_oracles[coin] = StubBinance(self.now, s_t=3000.6, s_open=3000.0)
         eng.clob = StubClob()
         warm(eng, self.now)
         return eng
@@ -420,7 +420,9 @@ class TestShadowMode(unittest.TestCase):
         self.eng = _engine2(self._tmp.name, coins_allowed=["bitcoin"],
                             coins_shadow=["ethereum"])
         self.eng.binance = StubBinance(self.now)
-        self.eng.coin_oracles["ethereum"] = StubBinance(self.now, s_t=3030.0,
+        # +$0.60 on $3000 => |z| ~ 1.2 at tau=3, inside the band max_abs_z allows.
+        # (Was 3030.0 — a 1% move in 3s, |z| ~ 57, which the gate now vetoes.)
+        self.eng.coin_oracles["ethereum"] = StubBinance(self.now, s_t=3000.6,
                                                          s_open=3000.0)
         self.eng.clob = StubClob()
         warm(self.eng, self.now)
@@ -491,7 +493,7 @@ class TestShadowMode(unittest.TestCase):
         eng = _engine2(self._tmp.name, coins_allowed=["bitcoin", "ethereum"],
                        coins_shadow=["ethereum"])
         eng.binance = StubBinance(self.now)
-        eng.coin_oracles["ethereum"] = StubBinance(self.now, s_t=3030.0, s_open=3000.0)
+        eng.coin_oracles["ethereum"] = StubBinance(self.now, s_t=3000.6, s_open=3000.0)
         eng.clob = StubClob()
         warm(eng, self.now)
         eng._maybe_snipe(FakeMarket(slug="e", coin="ethereum",

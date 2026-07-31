@@ -24,7 +24,8 @@ from .fill_engine import FillAttempt, book_is_stale
 from .ledger import Ledger
 from .logging_setup import get_logger
 from .oracle import BinanceOracle, ChainlinkOracle, coin_feed
-from .polymarket import ClobClientREST, GammaClient, Market, OrderBook, discover_markets
+from .polymarket import (ClobClientREST, GammaClient, Market, OrderBook, _parse_market,
+                         discover_markets)
 from .risk import CircuitBreaker, WarmupGate
 from .status_server import StatusState, make_server, write_status_loop
 from .strategy import (evaluate_close_snipe, resolve_winner, settle_sweep_target,
@@ -886,6 +887,9 @@ class Engine:
                 token_id, side, edge_fn, edge_min, price_min, price_max, cap_usd, latency_ms,
                 book_at_signal=book_at_signal, max_level_shares=max_level_shares_,
                 anomalous_mode=anomalous_mode,
+                # gamma-reported exchange minimum for THIS market (observed 5),
+                # so the live path cannot submit a size the CLOB will reject.
+                order_min_size=market.order_min_size,
             )
             # keep the depth reference fed with the fill-time book too
             self.depth.observe_book(market.family, attempt.book_at_fill, price_min, price_max)
@@ -938,7 +942,19 @@ class Engine:
         for slug in self.ledger.unresolved_markets():
             market = self.known_markets.get(slug)
             if market is None:
-                continue
+                # Orphaned position. `known_markets` is only ever populated by
+                # discovery (_do_discovery), and discovery calls gamma with
+                # `closed` OMITTED, which gamma treats as closed=false — so a
+                # market that resolved while we were down is NEVER rediscovered.
+                # Before this branch existed the position was skipped forever:
+                # its cost stayed in total_open_notional() (eating the global
+                # cap), its P&L never reached the daily breaker or the
+                # consecutive-loss brake, and status showed a phantom open
+                # position. In LIVE mode that is a real realised loss the risk
+                # system cannot see. Re-fetch with closed=True to recover it.
+                market = self._recover_orphaned_market(slug, now)
+                if market is None:
+                    continue
             if now < market.close_ts:
                 continue
             last_check = self.last_resolution_check.get(slug, 0.0)
@@ -946,6 +962,40 @@ class Engine:
                 continue
             self.last_resolution_check[slug] = now
             self._attempt_resolution(market, now, timeout_secs)
+
+    def _recover_orphaned_market(self, slug: str, now: float) -> Optional[Market]:
+        """Rebuild a Market for a filled-but-unresolved slug that discovery can
+        no longer see (bot restarted after the window closed).
+
+        Rate-limited by the same `last_resolution_check` clock as normal
+        resolution polling so a permanently unrecoverable slug cannot spin
+        gamma once per tick. Recovered markets are cached in `known_markets`
+        so the lookup happens once, not every poll.
+        """
+        last_check = self.last_resolution_check.get(slug, 0.0)
+        if now - last_check < float(self.config.resolution_cfg["gamma_poll_secs"]):
+            return None
+        self.last_resolution_check[slug] = now
+        try:
+            raw = self.gamma.get_market_by_slug(slug, closed=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("orphan recovery: gamma lookup failed for %s: %s", slug, exc)
+            return None
+        market = _parse_market(raw) if raw else None
+        if market is None:
+            log.warning("orphan recovery: could not rebuild market %s (gamma raw=%s)",
+                        slug, "empty" if not raw else "unparseable")
+            return None
+        log.warning("orphan recovery: rebuilt %s (family=%s close=%s) — this position "
+                    "was filled before a restart and would otherwise never resolve",
+                    slug, market.family, market.end_date.isoformat())
+        self.status.add_event("orphan_recovered", f"rebuilt unresolved market {slug}",
+                              family=market.family, slug=slug)
+        self.known_markets[slug] = market
+        # Reset the clock so _check_resolutions can poll it on this same pass
+        # rather than waiting another gamma_poll_secs.
+        self.last_resolution_check[slug] = 0.0
+        return market
 
     def _attempt_resolution(self, market: Market, now: float, timeout_secs: float) -> None:
         raw = self.gamma.get_market_by_slug(market.slug, closed=True)

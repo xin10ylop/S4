@@ -33,13 +33,32 @@ def fair_value_up(S_t: float, S_open: float, sigma_1s: float, tau_secs: float) -
         return None
     if sigma_1s <= 0 or tau_secs <= 0 or S_open <= 0 or S_t <= 0:
         return None
+    z = snipe_z(S_t, S_open, sigma_1s, tau_secs)
+    if z is None:
+        return None
+    return normal_cdf(z)
+
+
+def snipe_z(S_t: float, S_open: float, sigma_1s: float, tau_secs: float) -> Optional[float]:
+    """The standardised move `ln(S_t/S_open) / (sigma_1s * sqrt(tau))` that
+    `fair_value_up` feeds to the normal CDF. Split out so the caller can gate
+    on |z| directly: past `fair_cap` the CDF is clipped and no longer carries
+    the magnitude, so `fair` alone cannot tell |z|=2.1 from |z|=50.
+
+    Returns None on the same non-finite / non-positive inputs as
+    `fair_value_up`, so the two agree on what is skippable.
+    """
+    if not (math.isfinite(S_t) and math.isfinite(S_open) and math.isfinite(sigma_1s) and math.isfinite(tau_secs)):
+        return None
+    if sigma_1s <= 0 or tau_secs <= 0 or S_open <= 0 or S_t <= 0:
+        return None
     sigma = sigma_1s * math.sqrt(tau_secs)
     if sigma <= 0 or not math.isfinite(sigma):
         return None
     z = math.log(S_t / S_open) / sigma
     if not math.isfinite(z):
         return None
-    return normal_cdf(z)
+    return z
 
 
 def snipe_tau_bounds(cfg: dict, latency_ms: int) -> Tuple[float, float]:
@@ -125,6 +144,25 @@ def evaluate_close_snipe(
     fair_cap = float(cfg.get("fair_cap", 0.98))
     fair_up = min(max(fair_up, 1.0 - fair_cap), fair_cap)
     fair_down = 1.0 - fair_up
+
+    # |z| gate. `fair` is clipped at fair_cap for every |z| above ~2.05, so past
+    # the clip the model reports the IDENTICAL fair value for |z|=2.1 and
+    # |z|=50 — it carries no discriminating information there, and the apparent
+    # "edge" is an artifact of the clip meeting a cheap ask. A cheap ask at
+    # extreme |z| is the market pricing something our sigma missed (stale poll,
+    # floor binding, fat tail); that is adverse selection, not opportunity.
+    # Measured on 66 shipped bitcoin fills (docs/10_realmoney_audit.md §4):
+    #   |z| <= 5 -> 52 fills, 96.15% win, +20.38c/share
+    #   |z| >  5 -> 14 fills, 57.14% win, -12.92c/share
+    # against a 76.64% break-even win rate at the observed average ask. Gating
+    # is P&L-neutral at a flat cap (+$0.03/day) but cuts the worst single trade
+    # from -$45.26 to -$25.47 and is worth +53% on the compounding path.
+    # Set to null/None to disable.
+    max_abs_z = cfg.get("max_abs_z")
+    if max_abs_z is not None:
+        z = snipe_z(S_t, S_open, sigma_1s, tau)
+        if z is None or abs(z) > float(max_abs_z):
+            return None
 
     edge_min = float(cfg["edge_min"])
     price_min = float(cfg["price_min"])

@@ -252,6 +252,29 @@ strategy:
     fair_cap: 0.98            # model certainty saturates here; a Gaussian on polled 1s data
                               # cannot distinguish 99% from 99.9999% (fat-tail protection)
 
+    # ---------------- |z| GATE (docs/10_realmoney_audit.md §4) ----------------
+    # Skip the signal entirely when |ln(S_t/S_open) / (sigma_1s*sqrt(tau))|
+    # exceeds this. NOT a tuned threshold — it is where `fair` stops carrying
+    # information. fair_cap clips the CDF for every |z| above ~2.05, so beyond
+    # the clip the model returns the same `fair` for |z|=2.1 and |z|=50 while
+    # the reported `edge` keeps growing with how cheap the ask is. A cheap ask
+    # at |z|=50 is the book telling us our sigma is wrong, not a mispricing.
+    #
+    # Measured on 66 shipped bitcoin fills, $250 cap, 79 calendar days:
+    #   |z| <= 5 : 52 fills  96.15% win  +20.38c/share  +$512.87
+    #   |z| >  5 : 14 fills  57.14% win  -12.92c/share    -$2.63
+    # break-even win rate at the observed average ask (0.7534) is 76.64%, so
+    # the >5 bucket is 19 points under water. Gating is P&L-NEUTRAL at a flat
+    # cap ($6.46 -> $6.49/day) and buys:
+    #   worst single trade  -$45.26 -> -$25.47
+    #   30-trade 5th pct    +$57    -> +$117
+    #   9-month compounded  $449    -> $689  (return on notional 23.2% -> 30.0%)
+    # Caveat kept honest: audit/M3_multicoin_backtest.md §4.3 shows the Fisher
+    # p=0.0055 for this cut is split-dependent (p=0.81 on the neighbouring cut).
+    # It ships because it is mechanically motivated and costs nothing, NOT
+    # because the effect is statistically established. Set to null to disable.
+    max_abs_z: 5.0
+
     # ---------------- M4 GUARD 1: ADVERSE-SIZE FILTER (default OFF) ----------
     # Caps or skips an ask level whose size is anomalous relative to that
     # family's own recent typical depth:

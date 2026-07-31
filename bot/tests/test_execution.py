@@ -55,5 +55,74 @@ class TestExecutionRouterGuards(unittest.TestCase):
             m.assert_not_called()
 
 
+class TestParseFilledSize(unittest.TestCase):
+    """docs/10_realmoney_audit.md §2. The FAK response tells us how much
+    actually matched; recording the INTENDED walk instead makes every risk
+    control run on a position we may not own."""
+
+    def test_unknown_schema_returns_none_not_a_guess(self):
+        from polybot.execution import _parse_filled_size
+        self.assertIsNone(_parse_filled_size({"orderID": "0xabc", "status": "matched"}))
+        self.assertIsNone(_parse_filled_size(None))
+        self.assertIsNone(_parse_filled_size("ok"))
+
+    def test_explicit_failure_is_zero_shares(self):
+        from polybot.execution import _parse_filled_size
+        self.assertEqual(_parse_filled_size({"success": False, "errorMsg": "not enough balance"}),
+                         0.0)
+
+    def test_recognised_size_fields(self):
+        from polybot.execution import _parse_filled_size
+        for key in ("makingAmount", "sizeMatched", "matched_size", "filledSize"):
+            self.assertEqual(_parse_filled_size({"success": True, key: "12.5"}), 12.5,
+                             f"{key} should be recognised")
+
+    def test_nested_payload(self):
+        from polybot.execution import _parse_filled_size
+        self.assertEqual(_parse_filled_size({"success": True, "order": {"sizeMatched": 7.0}}), 7.0)
+
+    def test_unparseable_value_does_not_crash_or_lie(self):
+        from polybot.execution import _parse_filled_size
+        self.assertIsNone(_parse_filled_size({"sizeMatched": "n/a"}))
+
+
+class TestWalkTruncation(unittest.TestCase):
+    """A partial FAK fill got the CHEAP levels. Truncating from the expensive
+    end would understate our average price and overstate P&L."""
+
+    def _walk(self):
+        from polybot.fill_engine import LevelFill, WalkResult
+        return WalkResult(fills=[
+            LevelFill(price=0.70, shares=10.0, fee_per_share=0.0147),
+            LevelFill(price=0.72, shares=10.0, fee_per_share=0.0141),
+            LevelFill(price=0.74, shares=10.0, fee_per_share=0.0135),
+        ])
+
+    def test_keeps_cheapest_levels_first(self):
+        t = self._walk().truncated_to_shares(15.0)
+        self.assertAlmostEqual(t.total_shares, 15.0)
+        # 10 @ 0.70 + 5 @ 0.72 => avg 0.70667, NOT 0.73 (which is what keeping
+        # the expensive end would give)
+        self.assertAlmostEqual(t.avg_price, (10 * 0.70 + 5 * 0.72) / 15.0, places=9)
+
+    def test_truncation_never_flatters_the_average_price(self):
+        full = self._walk()
+        for filled in (1.0, 5.0, 12.0, 19.9, 25.0):
+            t = full.truncated_to_shares(filled)
+            self.assertLessEqual(t.avg_price, full.avg_price + 1e-12,
+                                 "a partial fill can only be CHEAPER on average, never dearer")
+
+    def test_zero_and_overfill_edges(self):
+        full = self._walk()
+        self.assertEqual(full.truncated_to_shares(0.0).total_shares, 0.0)
+        self.assertEqual(full.truncated_to_shares(-3.0).total_shares, 0.0)
+        self.assertIs(full.truncated_to_shares(30.0), full)
+        self.assertIs(full.truncated_to_shares(999.0), full)
+
+    def test_fees_scale_with_the_truncated_size(self):
+        t = self._walk().truncated_to_shares(10.0)
+        self.assertAlmostEqual(t.total_fees, 10.0 * 0.0147, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()

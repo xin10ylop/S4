@@ -10,19 +10,22 @@ win_rate 1.000 · EV/share **$0.2339** · 306 eval ticks.
 
 ## 0. Verdict
 
-**DO NOT FUND YET — two blocking items, both cheap to fix.** The edge itself survives every attack
-I ran. What is not ready is the *live order path*, which has never executed once, and the *live P&L
-ledger*, which is currently written to over-report.
+**DO NOT FUND YET.** Two independent audits (this one and a second by a different model with no
+shared context, §6b) reached the same verdict for overlapping reasons. The **edge survives every
+attack** either of us ran. What is not ready is everything around it: the live order path has never
+executed once, the wallet path does not exist, and the live sample is n=3.
 
 | | |
 |---|---|
 | Is the edge real? | **Yes, on 66 backtest fills.** t_day 2.25, win 87.9%, +$6.46/day at the $250 cap. |
-| Does the live n=3 confirm it? | **No — n=3 confirms nothing.** See §1. It is consistent with the edge; it is not evidence for it. |
-| Blocking defect 1 | `_place_live_order` records the **intended** walk as `filled` without parsing the CLOB response. Live P&L and position will be wrong. `bot/polybot/execution.py:250-258`. |
-| Blocking defect 2 | Live fills came in **~4× fatter** than the depth model predicts (p = 0.0092). Either the model understates depth or the paper engine over-fills. Unresolved. §3. |
-| Free improvement | **`|z| ≤ 5` gate.** Costs $0.03/day, raises win rate 87.9% → 96.2%, cuts worst trade −$45.26 → −$25.47. §4. |
-| Max bet per trade | **$250** (captures 98% of available P&L). $400 captures 100%. Above $400: **zero**. §5. |
+| Does the live n=3 confirm it? | **No — n=3 confirms nothing.** 95% CI on the win rate is [0.292, 1.000]. §1. |
+| Is the live sample even auditable? | **No.** The tape is not in this repo — `polybot.db` is empty, `fills.csv` is header-only, `git ls-files bot/data` is empty. §6b.1. |
+| Confirmed on live fills | **The fee model.** Realised 1.30¢/share vs `0.07·p·(1−p)` = 1.30¢ at p = 0.7534. §1. |
+| Fixed in this pass | \|z\| gate · live fill-quantity parsing · partial-fill truncation · exchange-minimum enforcement · orphaned-position recovery. §6c. |
+| Still blocking | Rejected orders are swallowed; no approval/balance/**redemption** code; `post_order` schema, `fee_rate_bps` and real fill size all unverified; live fills ran **4× fatter** than the depth model (p = 0.0092). §3, §6b, §8. |
+| Max bet per trade | **$250** (captures 97.9% of available P&L). $400 captures 100%. Above $400: **zero**. §5. |
 | Does it compound? | **Barely, and only up to ~$1,000 of bankroll.** Above that the order book binds on 92–100% of trades and $/day is frozen at ~$6.6. §6. |
+| First live clip | **$25**, not the shipped $250 — which would go live at 10× the repo's own recommendation. §6b.6. |
 
 ---
 
@@ -300,10 +303,92 @@ not about the world.
 
 ---
 
+## 6b. Independent second audit (different model, no shared context)
+
+A second auditor was run against the same repo with no access to my analysis and instructions to
+find reasons the strategy loses real money. It reached the **same verdict — DO NOT FUND YET** — and
+independently confirmed the two blockers above. It also found **five defects neither the prior work
+nor my pass had caught**, four of which are now fixed (§6c).
+
+**Where it corrected me.** I wrote in an earlier draft that an average fill price of $0.7534 against
+a realised EV/share of $0.2339 might indicate fair-value saturation. That inference is wrong:
+$0.2339 is *realised* P&L on three winners and equals `1 − avg_price − fee` by construction, so it
+carries **zero** information about model fair. Entry prices bound fair only weakly
+(fair ≥ ask + fee + edge_min ⇒ fair ≥ ~0.79). Whether the live trades were saturated is answerable
+only from the production `signals` rows. The saturation question is real (§4) but the price
+arithmetic does not speak to it.
+
+**Where it was right and I had missed it entirely:**
+
+1. **The live tape is not in this repo.** `bot/data/polybot.db` has 0 rows in `signals`/`fills`/
+   `resolutions`; `fills.csv` and `pnl.csv` are header-only; `polybot.log` covers 07-27→07-28 with
+   3 eval lines and no fills. The only archived tape holds 115 **settle_sweep** attempts — the dead
+   strategy's record survived and both winning close_snipe tapes did not. `git ls-files bot/data`
+   is empty: the ledger has never been committed. **Every live number in this audit is therefore
+   unverifiable from the repo**, mine included. The pasted figures are internally consistent
+   (§1 fee check) but consistency is not provenance.
+2. **Orphaned positions on restart** — a genuine live-money hole. Fixed, §6c.
+3. **`order_min_size` (5) and `tick_size` parsed but never enforced** — the paper walk books fills
+   of 2.4 shares that the CLOB rejects. Fixed, §6c.
+4. **Rejected orders are swallowed.** `_run_fill` catches the exception and logs; **no fill row is
+   written at all**. A live bot with no USDC allowance signals-and-errors forever and the ledger
+   reads "no signals converted", not "orders rejected".
+5. **No approval / balance / redemption code anywhere.** Winning CTF shares are never redeemed, so
+   USDC drains while the bot "wins". Not fixed — it needs a funded wallet to build against.
+6. **The shipped `per_event_cap_usd: 250` is a live-mode trap.** Flipping `mode.paper` today would
+   start real trading at **10× the repo's own recommended first clip** ($25–50). Nothing in code
+   enforces that the $250 was justified on *paper* evidence.
+7. **ETH shadow evaluation shares BTC's tick.** Hourly markets for both coins close at the same
+   instant, so the shadow coin's blocking book fetch (~155 ms) sits inside BTC's snipe tick, eating
+   the very tau margin `snipe_min_tau_secs: 2.5` exists to protect.
+8. **Status server binds `0.0.0.0` unauthenticated** on a root-run box.
+
+**Where I disagree with it, on measurement.** It proposed *size-capping* saturated-fair signals
+rather than vetoing high-|z| ones, on the grounds that the z-band rule failed walk-forward. I tested
+both on the 66 BTC fills:
+
+| policy | P&L | $/day | worst trade | return on notional | 30-tr 5th pct | 5th-pct max DD |
+|---|---|---|---|---|---|---|
+| SHIPPED flat $250 | $510.24 | $6.46 | −$45.26 | 23.2% | +$57 | −$71 |
+| **hard veto \|z\|>5** | **$512.87** | **$6.49** | **−$25.47** | **30.0%** | **+$117** | **−$37** |
+| size-cap $50 when \|z\|>5 | $491.12 | $6.22 | −$45.26 | 24.4% | +$53 | −$70 |
+| size-cap $25 when \|z\|>5 | $495.67 | $6.27 | −$25.91 | 26.0% | +$61 | −$51 |
+| size-cap $50 when fair pinned | $316.22 | $4.00 | −$45.26 | 19.9% | +$23 | −$71 |
+
+**The hard veto dominates every size-cap variant on every column.** Size-capping only helps when the
+cap sits *below* the trade's actual notional, and the worst trade (|z| = 6.53, $43.67 notional) is
+untouched by a $50 cap. Its concern — that the z-band rule failed walk-forward — is why the config
+comment ships the honest caveat rather than a significance claim, and why the gate is justified on
+being *free* rather than on being *proven*.
+
+---
+
+## 6c. What was fixed in this pass
+
+| # | defect | fix | tests |
+|---|---|---|---|
+| 1 | No \|z\| gate; \|z\|>5 traded at full $250 clip | `max_abs_z: 5.0`, enforced in `evaluate_close_snipe` after the sigma floor, two-sided, `null` disables. New `snipe_z()` shares the exact quantity `fair_value_up` feeds the CDF. | 8 behavioural + 5 mutations |
+| 2 | Live path recorded the **intended** walk as `filled` | `_parse_filled_size()` searches known field names and returns **None** rather than guessing; unknown ⇒ `outcome="filled_unverified"` + `log.error`; zero match ⇒ `book_moved_no_edge`; partial ⇒ `walk.truncated_to_shares()` | 10 behavioural + 5 mutations |
+| 3 | Partial fills would have kept the full walk's price ladder | `truncated_to_shares()` keeps the **cheapest** levels — the direction a real FAK fills — so a partial can only lower the average price, never flatter it | property test over 5 fill sizes |
+| 4 | `order_min_size` parsed, never enforced | live path refuses sub-minimum orders with `outcome="below_min_size"` instead of submitting one the CLOB rejects | 1 mutation |
+| 5 | Orphaned positions never resolved after a restart | `_recover_orphaned_market()` re-fetches with `closed=True`, caches into `known_markets`, rate-limited by `gamma_poll_secs`, fails soft on gamma errors | 4 behavioural + 3 mutations |
+
+**A test-fixture defect surfaced by the gate, worth recording.** `StubBinance` defaulted to
+`s_t=101_000` against `s_open=100_000` — a **1% BTC move with 3 seconds left**, which at
+`sigma=1e-4` is **|z| ≈ 57**. Six gating tests and three shadow-mode tests were asserting on a
+signal shape the shipped bot must now refuse. The fixture, not the gate, was wrong: it has been
+moved to +$20 on $100k (|z| ≈ 1.2), inside the band that actually carries the edge. This is a
+reminder that the old tests would have passed no matter how bad the high-|z| behaviour got.
+
+Suite: **307 → 328 passing.** Mutation checker: 54 → 69 checks.
+
+---
+
 ## 7. What I could not verify in this session
 
 | item | status | how to close |
 |---|---|---|
+| **The live sample itself** | **UNVERIFIED — the tape is not in this repo at all** (§6b.1) | commit the production `polybot.db` + logs |
 | The 3 live fills' `z` / `fair` / `sigma` | **UNVERIFIED** — no SSH from this container | the `fills.csv` command in §3 |
 | `post_order` response schema | **UNVERIFIED** | one $4 live order |
 | `fee_rate_bps` semantics | **UNVERIFIED** | same order's response |
@@ -315,15 +400,40 @@ not about the world.
 
 ## 8. Ordered plan to real money
 
-1. **Ship the `|z| ≤ 5` gate.** Free, mechanically motivated, cuts the worst trade 44%.
-2. **Fix the live ledger** — parse `post_order`, record *actual* filled shares, mark live fills
-   provisional until reconciled. Without this the circuit breaker is guarding a fiction.
-3. **One $4 live order** (5 shares, minimum size). Capture the raw response. Resolve the schema,
-   `fee_rate_bps`, and — critically — intended-vs-actual fill size (§3).
-4. **Run live at `per_event_cap_usd = 25`** until **30 resolved trades**. At 0.66 fills/day that is
-   **~45 days**. Bar: EV/share > +8¢, t_day > 2, win rate > 70%.
-5. **Only then** step to $100, and to $250 after another 30.
-6. **Never exceed $250** until §3 is resolved in favour of deeper live books.
+**Done in this pass** (§6c): `|z| ≤ 5` gate, live fill-quantity parsing with partial-fill
+truncation, exchange-minimum enforcement, orphaned-position recovery.
+
+**Still blocking, in order of dollars at risk:**
+
+1. **Commit the production tape.** `polybot.db` + logs. Until then no live claim in this repo —
+   including the +$126 — is verifiable, and the |z| question about the 3 wins cannot be answered.
+   One query answers it:
+   ```sql
+   SELECT market_slug, fair, ask,
+          json_extract(meta_json,'$.s_t')       AS s_t,
+          json_extract(meta_json,'$.s_open')    AS s_open,
+          json_extract(meta_json,'$.sigma_1s')  AS sigma,
+          json_extract(meta_json,'$.tau_secs')  AS tau
+   FROM signals;   -- then z = ln(s_t/s_open) / (sigma*sqrt(tau))
+   ```
+   If any of the three wins was |z| > 5, treat +$126 as luck from the bucket that runs −12.9¢/share.
+2. **Record rejected orders.** `_run_fill` currently swallows the exception (§6b.4). A live bot with
+   no USDC allowance would look identical to a quiet market. Make rejection a ledger outcome.
+3. **Build the wallet path** — USDC approval, CTF approval, balance check at startup, and
+   **redemption of winning shares** (§6b.5). None of it exists. Without redemption the account
+   drains while the bot wins.
+4. **One $4 live order** (5 shares). Capture the raw response. This single order resolves: the
+   `post_order` schema (and lets the guessed field list in `_FILLED_SIZE_KEYS` be replaced with the
+   real name), `fee_rate_bps`, and intended-vs-actual fill size — which is the §3 question.
+5. **Set `per_event_cap_usd: 25` before flipping `mode.paper`** (§6b.6). The shipped $250 was
+   justified on paper evidence only; it must not be the number that goes live first.
+6. **Run live at $25 until 30 resolved trades.** At 0.66 fills/day that is **~45 days**.
+   Bar: EV/share > +8¢, t_day > 2, win rate > 70%.
+7. **Only then** step to $100, and to $250 after another 30.
+8. **Never exceed $250** until §3 is resolved in favour of deeper live books.
+
+Items 1–3 cost nothing but time. Item 4 costs $4. There is no reason to pay real dollars to
+shortcut item 6 — the paper bot is collecting that evidence for free right now.
 
 Expected honest outcome if everything holds: **~$6.50/day, ~$195/month, from ~$2,250 of working
 capital.** That is an excellent *return on capital* and a small *absolute* number. Both facts are

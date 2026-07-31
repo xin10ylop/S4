@@ -78,6 +78,50 @@ from .polymarket import ClobClientREST
 log = get_logger("execution")
 
 
+# Field names that could carry "how many shares actually matched" in a
+# post_order response. NONE of these is confirmed against a real CLOB response
+# (see module docstring) — this list is deliberately a *search*, not a guess:
+# if none of them is present we return None and the caller records
+# `filled_unverified` rather than assuming the order filled. Add the real name
+# here once one live response has been inspected, and delete the rest.
+_FILLED_SIZE_KEYS = (
+    "makingAmount", "making_amount",       # py-clob-client / CTF exchange naming
+    "sizeMatched", "size_matched",
+    "matchedSize", "matched_size",
+    "filledSize", "filled_size",
+    "takingAmount", "taking_amount",
+)
+
+
+def _parse_filled_size(resp) -> Optional[float]:
+    """Best-effort extraction of matched share count from a post_order response.
+
+    Returns None when the payload carries no recognised size field — that is a
+    real answer ("we do not know"), not a failure to try, and the caller must
+    treat it as unreconciled rather than as a fill.
+
+    An explicit `success: false` is treated as zero matched shares.
+    """
+    if not isinstance(resp, dict):
+        return None
+    if resp.get("success") is False:
+        return 0.0
+    for key in _FILLED_SIZE_KEYS:
+        if key in resp:
+            try:
+                return float(resp[key])
+            except (TypeError, ValueError):
+                continue
+    # Some responses nest the match detail under an order/trade object.
+    for container in ("order", "orderHashes", "trades", "makerOrders"):
+        inner = resp.get(container)
+        if isinstance(inner, dict):
+            got = _parse_filled_size(inner)
+            if got is not None:
+                return got
+    return None
+
+
 class LiveTradingDisabled(RuntimeError):
     """Raised when LIVE mode is requested but a required guard is missing."""
 
@@ -104,6 +148,7 @@ class ExecutionRouter:
         book_at_signal=None,
         max_level_shares: Optional[float] = None,
         anomalous_mode: str = "cap",
+        order_min_size: float = 5.0,
     ) -> FillAttempt:
         """Unified entry point used by the engine for both strategies.
 
@@ -126,7 +171,8 @@ class ExecutionRouter:
                                            price_max, cap_usd, max_above_best,
                                            max_level_shares=max_level_shares,
                                            anomalous_mode=anomalous_mode,
-                                           max_book_age_s=max_book_age_s)
+                                           max_book_age_s=max_book_age_s,
+                                           order_min_size=order_min_size)
         return execute_taker_signal(
             self.clob_rest, token_id, side, edge_fn, edge_min, price_min, price_max, cap_usd,
             self.config.fee_rate, latency_ms, book_at_signal=book_at_signal, sleep=True,
@@ -191,6 +237,7 @@ class ExecutionRouter:
         max_level_shares: Optional[float] = None,
         anomalous_mode: str = "cap",
         max_book_age_s: Optional[float] = None,
+        order_min_size: float = 5.0,
     ) -> FillAttempt:
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY
@@ -240,6 +287,19 @@ class ExecutionRouter:
 
         limit_price = walk.fills[-1].price
         size = walk.total_shares
+        # Exchange minimum. `Market.order_min_size` is parsed from gamma
+        # (polymarket.py:122, observed 5) but was never enforced anywhere — the
+        # paper walk happily "fills" 2.4 shares, a size the CLOB rejects. A
+        # rejected order raises out of post_order and is swallowed by the
+        # engine's fill worker, so this would have shown up as silence, not as
+        # an error. Refuse the order instead of submitting a known-invalid one.
+        if size < order_min_size:
+            log.warning("LIVE ORDER SUPPRESSED token=%s: size %.4f < exchange minimum %.4f",
+                        token_id, size, order_min_size)
+            return FillAttempt(token_id=token_id, side=side, signal_time=signal_time,
+                                fill_time=time.time(), latency_ms=0, book_at_signal=book,
+                                book_at_fill=book, walk=WalkResult(), edge_min=edge_min,
+                                outcome="below_min_size")
         order_args = OrderArgs(token_id=token_id, price=limit_price, size=size, side=BUY)
         signed_order = client.create_order(order_args)
         log.warning("LIVE ORDER SUBMIT token=%s side=%s price=%s size=%s cap_usd=%s",
@@ -247,12 +307,37 @@ class ExecutionRouter:
         resp = client.post_order(signed_order, OrderType.FAK)
         log.warning("LIVE ORDER RESPONSE token=%s resp=%s", token_id, resp)
 
-        # NOTE (see module docstring): we deliberately do NOT parse a "filled
-        # shares" number out of `resp` — its schema is unverified here. We
-        # record the *intended* walk as an upper bound and outcome="filled"
-        # only when post_order did not raise; ledger consumers must treat
-        # LIVE fills as provisional until response parsing is implemented
-        # and reconciled against on-chain / portfolio balance.
+        # The order is FAK: it fills whatever is available at match time and
+        # cancels the rest. So `walk.total_shares` is an UPPER BOUND on what we
+        # own, never a measurement. Recording it as outcome="filled" (as this
+        # did before) makes the ledger, the win rate, the EV, the daily-loss
+        # breaker and the consecutive-loss brake all run on a position that may
+        # be partial or empty — the risk system blind by construction.
+        #
+        # We still do not GUESS a field name out of `resp` (its schema is
+        # unverified — see module docstring). Instead we look for the size
+        # under each name the py-clob-client / CLOB docs use, and if none is
+        # present we say so rather than assuming success.
+        filled = _parse_filled_size(resp)
+        if filled is None:
+            log.error("LIVE FILL SIZE UNKNOWN token=%s: post_order returned a payload with no "
+                      "recognised size field. Recording outcome=filled_unverified — this "
+                      "position MUST be reconciled against the on-chain balance before its "
+                      "P&L is trusted. Raw response: %s", token_id, resp)
+            outcome = "filled_unverified"
+        elif filled <= 0:
+            log.warning("LIVE ORDER token=%s: FAK matched 0 shares (book moved between our "
+                        "GET /book and the matching engine)", token_id)
+            return FillAttempt(token_id=token_id, side=side, signal_time=signal_time,
+                                fill_time=time.time(), latency_ms=0, book_at_signal=book,
+                                book_at_fill=book, walk=WalkResult(), edge_min=edge_min,
+                                outcome="book_moved_no_edge")
+        else:
+            if filled < size - 1e-9:
+                log.warning("LIVE PARTIAL FILL token=%s: intended %.4f shares, matched %.4f "
+                            "(%.1f%%)", token_id, size, filled, 100.0 * filled / size)
+                walk = walk.truncated_to_shares(filled)
+            outcome = "filled"
         return FillAttempt(token_id=token_id, side=side, signal_time=signal_time,
                             fill_time=time.time(), latency_ms=0, book_at_signal=book,
-                            book_at_fill=book, walk=walk, edge_min=edge_min, outcome="filled")
+                            book_at_fill=book, walk=walk, edge_min=edge_min, outcome=outcome)

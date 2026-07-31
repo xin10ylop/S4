@@ -75,6 +75,38 @@ class WalkResult:
         sh = self.total_shares
         return (self.total_cost / sh) if sh > 0 else None
 
+    def truncated_to_shares(self, filled_shares: float) -> "WalkResult":
+        """A copy of this walk trimmed to `filled_shares`, keeping the CHEAPEST
+        levels first.
+
+        Used by the LIVE path when a FAK order partially fills: the matching
+        engine works up the ask ladder, so a partial fill got the cheap levels
+        and missed the expensive tail. Truncating from the cheap end is
+        therefore the faithful reconstruction — truncating from the expensive
+        end would understate our average price and overstate P&L, which is the
+        exact direction of error this whole change exists to remove.
+
+        `filled_shares` above the walk total returns the walk unchanged; a
+        non-positive value returns an empty walk.
+        """
+        if filled_shares <= 0:
+            return WalkResult(n_levels_capped=self.n_levels_capped,
+                              n_levels_skipped=self.n_levels_skipped,
+                              shares_suppressed=self.shares_suppressed)
+        if filled_shares >= self.total_shares:
+            return self
+        kept: List[LevelFill] = []
+        remaining = filled_shares
+        for f in self.fills:  # already cheapest-first (walk_asks ascends price)
+            if remaining <= 0:
+                break
+            take = min(f.shares, remaining)
+            kept.append(LevelFill(price=f.price, shares=take, fee_per_share=f.fee_per_share))
+            remaining -= take
+        return WalkResult(fills=kept, n_levels_capped=self.n_levels_capped,
+                          n_levels_skipped=self.n_levels_skipped,
+                          shares_suppressed=self.shares_suppressed)
+
 
 def walk_asks(
     asks: List[BookLevel],

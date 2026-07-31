@@ -314,6 +314,81 @@ MUTATIONS = [
      "polybot/engine.py",
      "            except Exception:  # noqa: BLE001 - one bad feed must not stop the others\n                log.exception(\"oracle poll failed for %s\", coin)\n                return coin, None",
      "            except Exception:  # noqa: BLE001\n                raise"),
+    # ---- G5: |z| gate (docs/10_realmoney_audit.md §4) --------------------
+    ("G5 delete the |z| gate from evaluate_close_snipe",
+     "polybot/strategy.py",
+     "    if max_abs_z is not None:\n        z = snipe_z(S_t, S_open, sigma_1s, tau)\n"
+     "        if z is None or abs(z) > float(max_abs_z):\n            return None\n",
+     "    if False:\n        return None\n"),
+
+    ("G5 |z| gate silently inert when config omits max_abs_z",
+     "polybot/strategy.py",
+     '    max_abs_z = cfg.get("max_abs_z")',
+     '    max_abs_z = cfg.get("max_abs_z_TYPO")'),
+
+    ("G5 gate is one-sided (misses large DOWN moves)",
+     "polybot/strategy.py",
+     "        if z is None or abs(z) > float(max_abs_z):",
+     "        if z is None or z > float(max_abs_z):"),
+
+    ("G5 gate uses raw sigma instead of the floored sigma",
+     "polybot/strategy.py",
+     "        z = snipe_z(S_t, S_open, sigma_1s, tau)",
+     "        z = snipe_z(S_t, S_open, min(sigma_1s, 1e-9), tau)"),
+
+    ("G5 shipped config drops max_abs_z",
+     "config.yaml",
+     "    max_abs_z: 5.0",
+     "    max_abs_z: null"),
+
+    # ---- G6: live fill accounting (docs/10_realmoney_audit.md §2) --------
+    ("G6 unknown response schema assumed to be a full fill",
+     "polybot/execution.py",
+     "    if not isinstance(resp, dict):\n        return None",
+     "    if not isinstance(resp, dict):\n        return 1e9"),
+
+    ("G6 explicit success:false treated as a fill",
+     "polybot/execution.py",
+     '    if resp.get("success") is False:\n        return 0.0',
+     '    if False:\n        return 0.0'),
+
+    ("G6 partial fill not truncated (ledger keeps the intended size)",
+     "polybot/execution.py",
+     "                walk = walk.truncated_to_shares(filled)",
+     "                pass"),
+
+    ("G6 truncation keeps the EXPENSIVE levels (flatters avg price)",
+     "polybot/fill_engine.py",
+     "        for f in self.fills:  # already cheapest-first (walk_asks ascends price)",
+     "        for f in reversed(self.fills):"),
+
+    ("G6 zero-match FAK recorded as a fill",
+     "polybot/execution.py",
+     "        elif filled <= 0:",
+     "        elif False:"),
+
+    ("G6 exchange minimum order size not enforced",
+     "polybot/execution.py",
+     "        if size < order_min_size:",
+     "        if False:"),
+
+    # ---- G7: orphaned position recovery (docs/10_realmoney_audit.md §7) --
+    ("G7 orphaned positions skipped forever (the original bug)",
+     "polybot/engine.py",
+     "                market = self._recover_orphaned_market(slug, now)\n"
+     "                if market is None:\n                    continue",
+     "                continue"),
+
+    ("G7 orphan recovery queries gamma with closed=None (returns empty)",
+     "polybot/engine.py",
+     "            raw = self.gamma.get_market_by_slug(slug, closed=True)",
+     "            raw = self.gamma.get_market_by_slug(slug)"),
+
+    ("G7 orphan recovery not rate limited",
+     "polybot/engine.py",
+     '        if now - last_check < float(self.config.resolution_cfg["gamma_poll_secs"]):\n'
+     "            return None",
+     "        if False:\n            return None"),
 ]
 
 

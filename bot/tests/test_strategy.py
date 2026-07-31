@@ -173,3 +173,104 @@ class TestGuardsAreBehavioural(unittest.TestCase):
         lo_slow, _ = snipe_tau_bounds(self._cfg(), latency_ms=3000)
         self.assertGreater(lo_slow, lo_fast)
         self.assertGreaterEqual(lo_slow, 3.0 + 0.5)
+
+
+class TestMaxAbsZGate(unittest.TestCase):
+    """docs/10_realmoney_audit.md §4: |z|>5 fills won 57.1% on BTC against a
+    76.6% break-even. These are BEHAVIOURAL — deleting the gate from
+    evaluate_close_snipe must break them, not just change a number."""
+
+    def _cfg(self, **over):
+        cfg = {"snipe_last_secs": 5, "snipe_min_tau_secs": 2.5,
+               "snipe_fill_margin_secs": 0.5, "edge_min": 0.03,
+               "price_min": 0.30, "price_max": 0.99, "vol_window_secs": 120,
+               "sigma_1s_floor": 8e-6, "fair_cap": 0.98, "max_abs_z": 5.0}
+        cfg.update(over)
+        return cfg
+
+    @staticmethod
+    def _book(ask):
+        return _book("TOK", ask, ask_size=500.0)
+
+    def test_snipe_z_matches_fair_value_up(self):
+        """snipe_z must be the SAME quantity fair_value_up feeds the CDF,
+        otherwise the gate filters on something the model does not use."""
+        from polybot.strategy import normal_cdf, snipe_z
+        for S_t, S_open, sig, tau in [(65010.0, 65000.0, 2e-5, 3.0),
+                                       (64990.0, 65000.0, 5e-5, 4.5),
+                                       (65000.0, 65000.0, 1e-5, 2.5)]:
+            self.assertAlmostEqual(normal_cdf(snipe_z(S_t, S_open, sig, tau)),
+                                   fair_value_up(S_t, S_open, sig, tau), places=12)
+
+    def test_snipe_z_none_on_the_same_inputs_as_fair_value_up(self):
+        from polybot.strategy import snipe_z
+        for bad in [(101, 100, 0.0, 10), (101, 100, 0.001, 0),
+                    (float("nan"), 100, 0.001, 10), (101, 100, float("nan"), 10)]:
+            self.assertIsNone(snipe_z(*bad))
+            self.assertIsNone(fair_value_up(*bad))
+
+    def test_extreme_z_is_vetoed_even_though_edge_looks_huge(self):
+        """The exact shape that cost -$45.26 in the backtest: |z|~6.5, fair
+        pinned at the cap, a cheap ask, apparent edge ~0.49."""
+        from polybot.strategy import snipe_z
+        # +$16 on 65000 with tiny sigma over 3s => |z| well above 5
+        S_t, S_open, sigma, tau = 65016.0, 65000.0, 1.4e-5, 3.0
+        z = snipe_z(S_t, S_open, sigma, tau)
+        self.assertGreater(abs(z), 5.0, "test setup must actually be in the vetoed band")
+        m = FakeMarket(close_ts=1_000_000.0)
+        sig = evaluate_close_snipe(m, 1_000_000.0 - tau, S_t, S_open, sigma,
+                                    self._book(0.48), None, self._cfg(), fee_rate=0.07)
+        self.assertIsNone(sig, "|z|>5 must be vetoed")
+        # ...and with the gate disabled the very same inputs DO fire, which is
+        # what proves the veto is the thing doing the work.
+        ungated = evaluate_close_snipe(m, 1_000_000.0 - tau, S_t, S_open, sigma,
+                                        self._book(0.48), None,
+                                        self._cfg(max_abs_z=None), fee_rate=0.07)
+        self.assertIsNotNone(ungated)
+        self.assertGreater(ungated.edge, 0.4)
+
+    def test_moderate_z_still_fires(self):
+        """The gate must not swallow the band that carries the edge
+        (|z| in [1,5] won 97.8% at +19.3c/share)."""
+        from polybot.strategy import snipe_z
+        S_t, S_open, sigma, tau = 65004.0, 65000.0, 2.4e-5, 3.0
+        z = snipe_z(S_t, S_open, sigma, tau)
+        self.assertTrue(1.0 < abs(z) < 5.0, f"test setup off-band: z={z}")
+        sig = evaluate_close_snipe(FakeMarket(), 1_000_000.0 - tau, S_t, S_open, sigma,
+                                    self._book(0.70), None, self._cfg(), fee_rate=0.07)
+        self.assertIsNotNone(sig, "in-band signals must survive the gate")
+        self.assertEqual(sig.side, "up")
+
+    def test_gate_is_two_sided(self):
+        """A large DOWN move must be vetoed too — not just large UP moves."""
+        S_t, S_open, sigma, tau = 64984.0, 65000.0, 1.4e-5, 3.0
+        sig = evaluate_close_snipe(FakeMarket(), 1_000_000.0 - tau, S_t, S_open, sigma,
+                                    None, self._book(0.48), self._cfg(), fee_rate=0.07)
+        self.assertIsNone(sig)
+
+    def test_gate_applies_after_the_sigma_floor(self):
+        """|z| must be computed from the FLOORED sigma. Using raw sigma would
+        veto quiet-market signals the floor was designed to keep honest."""
+        from polybot.strategy import snipe_z
+        S_t, S_open, tau = 65000.5, 65000.0, 3.0
+        quiet = 1e-7
+        self.assertGreater(abs(snipe_z(S_t, S_open, quiet, tau)), 5.0)      # raw: vetoed
+        self.assertLess(abs(snipe_z(S_t, S_open, 8e-6, tau)), 5.0)          # floored: allowed
+        sig = evaluate_close_snipe(FakeMarket(), 1_000_000.0 - tau, S_t, S_open, quiet,
+                                    self._book(0.50), None, self._cfg(), fee_rate=0.07)
+        self.assertIsNotNone(sig, "the floor must be applied before the |z| gate")
+
+    def test_gate_disabled_by_null(self):
+        cfg = self._cfg(max_abs_z=None)
+        S_t, S_open, sigma, tau = 65016.0, 65000.0, 1.4e-5, 3.0
+        self.assertIsNotNone(evaluate_close_snipe(FakeMarket(), 1_000_000.0 - tau, S_t,
+                                                   S_open, sigma, self._book(0.48), None,
+                                                   cfg, fee_rate=0.07))
+
+    def test_shipped_config_actually_sets_the_gate(self):
+        """Guards that exist only in tests are not guards."""
+        import yaml
+        cfg = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml").read_text())
+        snipe = cfg["strategy"]["close_snipe"]
+        self.assertIn("max_abs_z", snipe)
+        self.assertEqual(float(snipe["max_abs_z"]), 5.0)
