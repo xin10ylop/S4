@@ -513,11 +513,13 @@ def main():
     ap.add_argument("--max-book-age", type=float, default=INF)
     ap.add_argument("--cap-usd", type=float, default=250.0)
     ap.add_argument("--edge-min", type=float, default=0.03)
+    ap.add_argument("--max-walk-above-best", type=float, default=0.03,
+                    help="cents above best ask the fill walk may climb; the measured\n                          binding constraint on P&L (docs/11_deep_fills.md)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     p = HParams(max_book_age_s=a.max_book_age, per_event_cap_usd=a.cap_usd,
-                edge_min=a.edge_min)
+                edge_min=a.edge_min, max_walk_above_best=a.max_walk_above_best)
     rows, trs = [], []
     for coin in [c for c in a.coins.split(",") if c in COINS]:
         tape = CoinTape(coin)
