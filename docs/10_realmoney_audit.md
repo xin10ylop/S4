@@ -449,3 +449,74 @@ shortcut item 6 — the paper bot is collecting that evidence for free right now
 Expected honest outcome if everything holds: **~$6.50/day, ~$195/month, from ~$2,250 of working
 capital.** That is an excellent *return on capital* and a small *absolute* number. Both facts are
 true and the second one is the one that gets forgotten.
+
+---
+
+## 9. CORRECTION (2026-08-05) — the |z| gate was wrong and has been reverted
+
+**The gate shipped in §6c was live for one day and is now disabled.** The production tape refutes
+it. This section supersedes §4 and the §6c row for `max_abs_z`.
+
+### 9.1 What the live data says
+
+`bot/scripts/per_trade_z.sql` on the production DB, 10 resolved fills:
+
+| bucket | n | win rate | notional | P&L | % of all P&L |
+|---|---|---|---|---|---|
+| \|z\| < 1 | 4 | 50.0% | $19.40 | **−$0.03** | −0.0% |
+| \|z\| 1–5 | 4 | 100.0% | $57.05 | +$9.68 | 7.3% |
+| **\|z\| > 5** | **2** | **100.0%** | **$399.10** | **+$123.21** | **92.7%** |
+
+The two `|z| > 5` trades were |z| = 32.42 (+$95.96) and |z| = 7.62 (+$27.25). **The shipped gate
+would have vetoed both, destroying 92.7% of every dollar this bot has earned, and avoided exactly
+zero losses.** Both live losses were |z| = 0.90 and |z| = 0.11 — *inside* the band the gate protects.
+
+### 9.2 The measurement error
+
+I selected the gate on **EV per share**, which weights every trade equally. High-|z| signals are
+the **deep** ones — when `fair` pins at the cap and the ask is cheap, the walk goes further down the
+ladder. Live, that bucket is 20% of trades but **84% of notional**. So an equal-weighted statistic
+systematically understates its dollar importance.
+
+The backtest hid this because the bucket happened to be dollar-neutral there (−$2.63 of $510, 22%
+of notional). I *reported* that neutrality in §4 and then shipped the gate anyway, justifying it on
+variance reduction and a compounding projection — both of which are derived from the same
+equal-weighted framing. **A gate whose dollar effect is indistinguishable from zero on the only
+data you have is not "free"; it is unmeasured.** That is the actual lesson, and it applies to the
+`|z| ∈ [1,5]` variant too.
+
+Gate comparison in dollars, which is how this should have been judged from the start:
+
+| gate | backtest P&L | vs none | live P&L | vs none |
+|---|---|---|---|---|
+| **none (shipped, correct)** | **$510.24** | — | **$132.86** | — |
+| `max_abs_z = 5` (reverted) | $512.87 | +$2.63 | $9.65 | **−$123.21** |
+| min \|z\| ≥ 1.0 | $489.90 | −$20.34 | $132.89 | +$0.03 |
+| \|z\| ∈ [1, 5] | $492.54 | −$17.70 | $9.68 | −$123.18 |
+
+### 9.3 What is and is not concluded
+
+- **`max_abs_z` ships as `null`.** The mechanism, `snipe_z()`, and all eight behavioural tests are
+  retained; a mutation now fires if anyone silently re-enables it. The test asserting the shipped
+  value was inverted to demand `null`.
+- **A min-|z| floor is NOT shipped either.** It is the shape the evidence gestures at (|z| < 1 went
+  2/4 for −$0.03 live, and 31 fills at 51.6% win in the multi-coin backtest) but it costs $20.34 on
+  the BTC backtest and gains $0.03 live. That is nothing, in both directions, and shipping it would
+  repeat exactly the error above.
+- **n = 2 does not establish that high |z| is good**, any more than n = 14 established it was bad.
+  The honest state is: **no |z| rule has a demonstrated dollar effect in either direction**, and the
+  burden is on any future gate to show one *in dollars*, on the live tape, before it goes near the
+  config.
+- Everything else in §6c — live fill-quantity parsing, partial-fill truncation, exchange-minimum
+  enforcement, orphaned-position recovery — is unaffected. Those are correctness fixes, not
+  edge-selection bets, and none of them touches which signals are taken.
+
+### 9.4 What the tape confirms that is not a correction
+
+- **The fill engine is calibrated.** The 7 fills after the first snapshot averaged **$9.92** of
+  notional against a backtest median of **$10.51**. The "live fills run 4× fatter than the depth
+  model" concern in §3 is resolved: the first three fills were fat books, not an over-filling
+  simulator. The $250 cap ceiling in §5 stands as measured.
+- **P&L is dominated by two trades.** $123.21 of $132.86 came from two fills. The other eight
+  produced $9.65 across eight days. Any statement about this strategy's daily earnings that does not
+  say so is misleading.

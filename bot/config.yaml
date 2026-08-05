@@ -269,11 +269,29 @@ strategy:
     #   worst single trade  -$45.26 -> -$25.47
     #   30-trade 5th pct    +$57    -> +$117
     #   9-month compounded  $449    -> $689  (return on notional 23.2% -> 30.0%)
-    # Caveat kept honest: audit/M3_multicoin_backtest.md §4.3 shows the Fisher
-    # p=0.0055 for this cut is split-dependent (p=0.81 on the neighbouring cut).
-    # It ships because it is mechanically motivated and costs nothing, NOT
-    # because the effect is statistically established. Set to null to disable.
-    max_abs_z: 5.0
+    # DISABLED 2026-08-05 — REFUTED BY LIVE DATA. Do not re-enable without
+    # reading docs/10_realmoney_audit.md §9.
+    #
+    # This gate shipped at 5.0 and was reverted after one day live. The first
+    # 10 resolved live fills (bot/scripts/per_trade_z.sql on the production
+    # tape) put |z|>5 at 2 fills, 2 wins, +$123.21 — 92.7% of all P&L ever
+    # earned by this bot. The gate would have vetoed both and avoided ZERO
+    # losses. Both live losses were |z| = 0.90 and 0.11, i.e. INSIDE the band
+    # the gate protects.
+    #
+    # The measurement error that produced it: EV/share weights every trade
+    # equally, but high-|z| signals are the DEEP ones (live: 20% of trades,
+    # 84% of notional). Optimising an equal-weighted statistic on a backtest
+    # where the bucket happened to be dollar-neutral (-$2.63 of $510) hid the
+    # fact that it carries the size. Judge gates in DOLLARS, not c/share.
+    #
+    # A min-|z| FLOOR is the shape the evidence actually points at (|z|<1 went
+    # 2/4 live for -$0.03, and 31 fills at 51.6% win in the multi-coin
+    # backtest) — but it costs -$20.34 on the BTC backtest and gains +$0.03
+    # live, i.e. nothing either way. Not shipped. See §9.
+    #
+    # null = no |z| gating, which is the shipped and evidenced behaviour.
+    max_abs_z: null
 
     # ---------------- M4 GUARD 1: ADVERSE-SIZE FILTER (default OFF) ----------
     # Caps or skips an ask level whose size is anomalous relative to that

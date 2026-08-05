@@ -267,10 +267,17 @@ class TestMaxAbsZGate(unittest.TestCase):
                                                    S_open, sigma, self._book(0.48), None,
                                                    cfg, fee_rate=0.07))
 
-    def test_shipped_config_actually_sets_the_gate(self):
-        """Guards that exist only in tests are not guards."""
+    def test_shipped_config_ships_the_gate_DISABLED(self):
+        """The gate mechanism is kept and tested, but it must ship OFF.
+
+        It was live for one day and would have vetoed 92.7% of this bot's
+        realised P&L while avoiding zero losses (docs/10_realmoney_audit.md
+        §9). If someone re-enables it, this test is where they must come and
+        justify it against that tape."""
         import yaml
         cfg = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml").read_text())
         snipe = cfg["strategy"]["close_snipe"]
-        self.assertIn("max_abs_z", snipe)
-        self.assertEqual(float(snipe["max_abs_z"]), 5.0)
+        self.assertIn("max_abs_z", snipe, "keep the key present and documented")
+        self.assertIsNone(snipe["max_abs_z"],
+                          "max_abs_z is REFUTED by live data and must ship as null "
+                          "— see docs/10_realmoney_audit.md §9")

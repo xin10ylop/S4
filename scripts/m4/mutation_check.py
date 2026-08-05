@@ -336,10 +336,10 @@ MUTATIONS = [
      "        z = snipe_z(S_t, S_open, sigma_1s, tau)",
      "        z = snipe_z(S_t, S_open, min(sigma_1s, 1e-9), tau)"),
 
-    ("G5 shipped config drops max_abs_z",
+    ("G5 shipped config silently re-enables the refuted |z| gate",
      "config.yaml",
-     "    max_abs_z: 5.0",
-     "    max_abs_z: null"),
+     "    max_abs_z: null",
+     "    max_abs_z: 5.0"),
 
     # ---- G6: live fill accounting (docs/10_realmoney_audit.md §2) --------
     ("G6 unknown response schema assumed to be a full fill",
