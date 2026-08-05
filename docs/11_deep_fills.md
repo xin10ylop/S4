@@ -140,18 +140,42 @@ comparing full-ladder live fills against a top-of-book backtest. The 7 subsequen
 averaging $9.92 against a $10.51 backtest median (docs/10 §9.4) says those were thin books where
 top-of-book ≈ full ladder — consistent, and it does not tell us about the deep ones.
 
-**The open question, stated precisely:** on the live deep fills, how many levels did the bot walk,
-and how far above the best ask did it get? `bot/scripts/ladder_depth.sql` answers it from
-`fills.levels_json`.
+### 4.1 MEASURED (2026-08-05) — the deep fills are multi-level, and both bounds bind
 
-- If the deep fills are **1 level**, the backtest capacity numbers hold and $250 is genuinely near
-  the ceiling.
-- If they are **multi-level and hitting the 3¢ bound**, then `max_walk_above_best` is a live lever
-  the backtest cannot see, capacity is materially higher than $285, and the max-bet answer in
-  docs/10 §5 needs re-deriving from live data.
+`bot/scripts/ladder_depth.sql` on the production tape:
 
-**Do not relax `max_walk_above_best` on speculation.** It was set to 0.03 after the first live loss
-(−$25.41) came from walking 10¢+ deep into a book against a 7σ jump. Measure first.
+| trade | levels | best → last | walked | cost | P&L | what bound it |
+|---|---|---|---|---|---|---|
+| **07-28 4am** | **4** | 0.70 → 0.73 | **0.0300** | $250.00 | **+$95.96** | **`$250` cap AND the 3¢ walk, simultaneously** |
+| 07-29 11pm | 2 | 0.83 → 0.85 | 0.0200 | $149.10 | +$27.25 | book exhausted |
+| **08-05 12am** | **4** | 0.91 → 0.94 | **0.0300** | $27.78 | +$2.08 | **3¢ walk bound** |
+| 07-31 5pm | 1 | 0.79 | 0.0000 | $13.67 | +$3.43 | book exhausted |
+| 08-03 3am | 2 | 0.85 → 0.87 | 0.0200 | $8.60 | +$1.32 | book exhausted |
+| 07-30 6am | 2 | 0.69 → 0.71 | 0.0200 | $7.00 | +$2.85 | book exhausted |
+| 08-04 5am | 2 | 0.69 → 0.71 | 0.0200 | $7.00 | +$2.85 | book exhausted |
+| 08-01 6am | 2 | 0.57 → 0.59 | 0.0200 | $5.80 | −$5.97 | book exhausted |
+| 08-02 9am | 2 | 0.33 → 0.35 | 0.0200 | $3.40 | +$6.44 | book exhausted |
+| 08-04 11am | 2 | 0.31 → 0.33 | 0.0200 | $3.20 | −$3.35 | book exhausted |
+
+**Live walks a mean of 2.3 levels and a max of 4. The backtest walks 1, always.**
+
+The 07-28 ladder ends at `(0.73, 9.567808219178117)` — a fractional share count, which is the
+`per_event_cap_usd` truncating mid-level. So that trade was stopped by the **cap** *and* was
+simultaneously sitting exactly on the **3¢ walk bound**. Both constraints binding at once, on the
+trade that produced 72% of all P&L to date.
+
+**The decisive number:** on that trade, top-of-book alone was 51.45 shares = **$36.02**, i.e.
+**14% of the $250 actually filled**. On 07-29 it was 62%. The top-of-book backtest is not slightly
+conservative on the deep fills — it is missing most of them.
+
+**Therefore:** every capacity figure in docs/10 §5 is void as a ceiling. `max_walk_above_best` IS a
+live lever the backtest cannot see. Whether to move it — and whether to move the cap with it — is a
+separate question, because walking deeper raises the average price and therefore the break-even win
+rate, and because the deepest walks happen on saturated-fair signals which are the worst-calibrated
+part of the model. That analysis is in §6.
+
+**Still true: do not relax `max_walk_above_best` on speculation.** It is 0.03 because the first live
+loss (−$25.41) came from walking 10¢+ deep against a 7σ jump.
 
 ---
 
