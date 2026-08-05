@@ -21,8 +21,10 @@ executed once, the wallet path does not exist, and the live sample is n=3.
 | Does the live n=3 confirm it? | **No — n=3 confirms nothing.** 95% CI on the win rate is [0.292, 1.000]. §1. |
 | Is the live sample even auditable? | **No.** The tape is not in this repo — `polybot.db` is empty, `fills.csv` is header-only, `git ls-files bot/data` is empty. §6b.1. |
 | Confirmed on live fills | **The fee model.** Realised 1.30¢/share vs `0.07·p·(1−p)` = 1.30¢ at p = 0.7534. §1. |
-| Fixed in this pass | \|z\| gate · live fill-quantity parsing · partial-fill truncation · exchange-minimum enforcement · orphaned-position recovery. §6c. |
-| Still blocking | Rejected orders are swallowed; no approval/balance/**redemption** code; `post_order` schema, `fee_rate_bps` and real fill size all unverified; live fills ran **4× fatter** than the depth model (p = 0.0092). §3, §6b, §8. |
+| Fixed in this pass | live fill-quantity parsing · partial-fill truncation · exchange-minimum enforcement · orphaned-position recovery. §6c. |
+| **\|z\| gate — REVERTED** | Shipped, live for one day, **refuted by the production tape**: it would have destroyed **92.7%** of all P&L and avoided zero losses. **§9 supersedes §4.** |
+| Still blocking | Rejected orders are swallowed; no approval/balance/**redemption** code; `post_order` schema, `fee_rate_bps` and real fill size all unverified. §6b, §8. |
+| ~~Fills 4× fatter than the model~~ | **RESOLVED.** The next 7 live fills averaged $9.92 vs a backtest median of $10.51. The first three were fat books, not an over-filling simulator. §9.4. |
 | Max bet per trade | **$250** (captures 97.9% of available P&L). $400 captures 100%. Above $400: **zero**. §5. |
 | Does it compound? | **Barely, and only up to ~$1,000 of bankroll.** Above that the order book binds on 92–100% of trades and $/day is frozen at ~$6.6. §6. |
 | First live clip | **$25**, not the shipped $250 — which would go live at 10× the repo's own recommendation. §6b.6. |
@@ -95,7 +97,7 @@ may be rejected — or may fill at a fee we did not model.
 
 ---
 
-## 3. Blocking defect 2 — live fills are 4× fatter than the depth model
+## 3. ~~Blocking defect 2 — live fills are 4× fatter than the depth model~~ — **RESOLVED, see §9.4**
 
 | | backtest (5-level snapshots, $250 cap) | live (3 fills) |
 |---|---|---|
@@ -138,7 +140,15 @@ the good band or lucky ones in the bad band.
 
 ---
 
-## 4. The free improvement: gate `|z| ≤ 5`
+## 4. ~~The free improvement: gate `|z| ≤ 5`~~ — **SUPERSEDED BY §9, DO NOT ACT ON THIS SECTION**
+
+> **This section is retained as the record of a wrong call, not as guidance.** The gate it
+> recommends was shipped, ran live for one day, and would have destroyed 92.7% of this bot's
+> realised P&L while avoiding zero losses. The error — selecting on EV/share, which is
+> equal-weighted, when the bucket in question carries 84% of the notional — is dissected in §9.2.
+> `max_abs_z` now ships as `null`.
+
+### 4.1 (historical) the argument as it was made
 
 Bitcoin, shipped params, 66 fills, $250 cap, 79 calendar days:
 
