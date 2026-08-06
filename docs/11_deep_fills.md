@@ -17,7 +17,8 @@ can we get more of them, and what is the realistic monthly number?
 | Can we predict them? | **No.** \|z\|, tau, sigma, fair and book age are statistically indistinguishable between deep and shallow fills. |
 | Can we select for them? | **No — and that is the point.** You cannot know the book is deep until the signal fires, and by then you already take everything profitable. |
 | Realistic monthly P&L | **median $209, IQR $132–298, 5–95% $46–450.** Losing month ~1%. §3. |
-| Biggest open lever | The whole backtest is **top-of-book only** — it never walked past level 1. Live full-ladder capacity is unmeasured and is a **floor**, not a ceiling. §4. |
+| Biggest open lever | **None found.** The backtest is top-of-book only so its capacity numbers are void (§4), but the live ladder shows `max_walk_above_best` was never the binding constraint — moving it is worth **$0.00**. §4.2. |
+| Config changes recommended | **Zero.** §4.3. |
 
 ---
 
@@ -159,23 +160,49 @@ top-of-book ≈ full ladder — consistent, and it does not tell us about the de
 
 **Live walks a mean of 2.3 levels and a max of 4. The backtest walks 1, always.**
 
-The 07-28 ladder ends at `(0.73, 9.567808219178117)` — a fractional share count, which is the
-`per_event_cap_usd` truncating mid-level. So that trade was stopped by the **cap** *and* was
-simultaneously sitting exactly on the **3¢ walk bound**. Both constraints binding at once, on the
-trade that produced 72% of all P&L to date.
-
-**The decisive number:** on that trade, top-of-book alone was 51.45 shares = **$36.02**, i.e.
+**The decisive number:** on the 07-28 trade, top-of-book alone was 51.45 shares = **$36.02**, i.e.
 **14% of the $250 actually filled**. On 07-29 it was 62%. The top-of-book backtest is not slightly
-conservative on the deep fills — it is missing most of them.
+conservative on the deep fills — it is missing most of them, and every capacity figure in
+docs/10 §5 is void as a ceiling.
 
-**Therefore:** every capacity figure in docs/10 §5 is void as a ceiling. `max_walk_above_best` IS a
-live lever the backtest cannot see. Whether to move it — and whether to move the cap with it — is a
-separate question, because walking deeper raises the average price and therefore the break-even win
-rate, and because the deepest walks happen on saturated-fair signals which are the worst-calibrated
-part of the model. That analysis is in §6.
+### 4.2 CORRECTION — `max_walk_above_best` is NOT the lever. It is worth $0.00.
 
-**Still true: do not relax `max_walk_above_best` on speculation.** It is 0.03 because the first live
-loss (−$25.41) came from walking 10¢+ deep against a 7σ jump.
+My first reading of the table above said two fills were "walk bound". **That was wrong**, and an
+independent agent caught it. Working the constraint arithmetic per fill, with `fair` pinned at 0.98:
+
+| trade | last taken | edge there | edge one tick higher | what would actually stop the next tick |
+|---|---|---|---|---|
+| 07-28 4am | 0.73 | +0.2362 | +0.2265 at 0.74 | **`$250` CAP** — the level shows `9.5678` shares, a fraction, so the cap had already truncated *mid-level*. The walk bound is a second constraint queued behind it and never gets a say. |
+| 08-05 12am | 0.94 | +0.0361 | **+0.0267 at 0.95** | **`edge_min = 0.03`.** 0.0267 < 0.03. That 0.94 happens to equal 0.91 + 0.03 is a **coincidence**. |
+| 07-29 11pm | 0.85 | +0.1211 | +0.1116 at 0.86 | nothing — the book simply ran out at two levels. |
+
+**No live fill has ever been bound by `max_walk_above_best`.** Raising it from 0.03 in isolation
+would have changed exactly zero fills and earned exactly $0.00. It stays where it is.
+
+This is the same trap as the |z| gate, caught before shipping this time: two fills *sat on* the 0.03
+line, which looks like the bound binding, but in both cases a different constraint had already
+stopped the walk. **Sitting on a limit is not the same as being bound by it.**
+
+### 4.3 The cap is the only real lever, and it is leverage, not edge
+
+The `$250` cap bound exactly **1 of 10** live fills. Raising it to $500 would have let 07-28 take
+the remainder of the 0.73 level — size unknown, since the ladder records what we *took*, not what
+was *there* — and then stopped anyway at 0.74, which is outside the 3¢ walk. So the upside is
+bounded and unmeasured.
+
+**And it cuts both ways.** That trade cost $250 and won $95.96. Had it lost, it would have been
+**−$255**. Raising the cap does not improve the edge; it scales the same edge and the same tail.
+That makes it a **bankroll question** (docs/10 §5.2: quarter-Kelly on the 95% lower bound of the win
+rate = 11.1% of bankroll), not a market-capacity question. At the current $1,250 configured
+bankroll, $250/trade is already 20% per trade — **above** conservative Kelly.
+
+**Conclusion: no config change.** Not the walk bound ($0.00, measured), not `edge_min` (lowering it
+buys 0.0267-edge fills, which is thinner edge and more adverse selection, for a few dollars), and
+not the cap (leverage, already above Kelly, and the first live clip should be $25 anyway).
+
+**And still true regardless:** `max_walk_above_best` is 0.03 because the first live loss (−$25.41)
+came from walking 10¢+ deep against a 7σ jump. The measurement above says there is nothing to gain
+by moving it; that history says there is something to lose.
 
 ---
 
